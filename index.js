@@ -1,10 +1,5 @@
 // ============================================================
-//  SOLANA MULTI-WALLET TRACKER
-//  For Render + QuickNode Webhooks
-//  
-//  Set these in Render > Environment:
-//    TELEGRAM_TOKEN  = your bot token from BotFather
-//    CHAT_ID         = your Telegram chat ID
+//  SOLANA MULTI-WALLET TRACKER (REVISED)
 // ============================================================
 
 const express = require('express');
@@ -62,8 +57,8 @@ const WALLETS = new Set([
 ]);
 
 // ── STATE ─────────────────────────────────────────────────────
-let activeAlerts  = {};  // tokenMint -> Set of wallet addresses
-let mintTimeCache = {};  // tokenMint -> unix timestamp
+let activeAlerts  = {};  
+let mintTimeCache = {};  
 
 // ── HELPERS ───────────────────────────────────────────────────
 function log(msg) {
@@ -88,7 +83,8 @@ function sendTelegram(message) {
   const body = JSON.stringify({
     chat_id: CHAT_ID,
     text: message,
-    parse_mode: 'HTML'
+    parse_mode: 'HTML',
+    disable_web_page_preview: false
   });
   const options = {
     hostname: 'api.telegram.org',
@@ -101,112 +97,77 @@ function sendTelegram(message) {
   };
   return new Promise((resolve) => {
     const req = https.request(options, (res) => {
-      let data = '';
-      res.on('data', c => data += c);
-      res.on('end', () => {
-        try {
-          const parsed = JSON.parse(data);
-          if (parsed.ok) log('[TG] Alert sent successfully');
-          else log(`[TG] Error: ${JSON.stringify(parsed)}`);
-        } catch(e) {}
-        resolve();
-      });
+      res.on('data', () => {});
+      res.on('end', () => resolve());
     });
-    req.on('error', (e) => { log(`[TG] Request failed: ${e.message}`); resolve(); });
+    req.on('error', () => resolve());
     req.write(body);
     req.end();
   });
 }
 
 async function getMintAge(mint, txTime) {
-  if (mintTimeCache[mint]) {
-    return txTime - mintTimeCache[mint];
-  }
+  if (mintTimeCache[mint]) return txTime - mintTimeCache[mint];
   try {
-    const data = await httpsGet(
-      `https://api.dexscreener.com/latest/dex/tokens/${mint}`
-    );
+    const data = await httpsGet(`https://api.dexscreener.com/latest/dex/tokens/${mint}`);
     const pairs = data?.pairs;
     if (pairs && pairs.length > 0 && pairs[0].pairCreatedAt) {
       const created = Math.floor(pairs[0].pairCreatedAt / 1000);
       mintTimeCache[mint] = created;
       return txTime - created;
     }
-  } catch (e) {
-    log(`[DEX] Lookup failed for ${mint.substring(0,8)}: ${e.message}`);
-  }
+  } catch (e) {}
   return null;
 }
 
 // ── PROCESS ONE TRANSACTION ───────────────────────────────────
 async function handleTx(tx) {
   try {
-    // QuickNode webhook can send parsed or raw format — handle both
-    const accountKeys =
-      tx.transaction?.message?.accountKeys?.map(k => k?.pubkey ?? k) ??
-      tx.accountKeys ??
-      [];
+    // 1. Extract ALL possible account keys (handling Legacy and V0 transactions)
+    const accountKeys = [
+        ...(tx.transaction?.message?.accountKeys?.map(k => k?.pubkey ?? k) ?? []),
+        ...(tx.accountKeys ?? []),
+        ...(tx.meta?.loadedAddresses?.writable ?? []),
+        ...(tx.meta?.loadedAddresses?.readonly ?? [])
+    ].filter(Boolean);
 
-    const feePayer =
-      tx.transaction?.message?.accountKeys?.[0]?.pubkey ??
-      tx.transaction?.message?.accountKeys?.[0] ??
-      tx.feePayer ??
-      null;
+    if (accountKeys.length === 0) return;
 
-    // Find which of our tracked wallets is in this tx
-    const allAccounts = [feePayer, ...accountKeys].filter(Boolean);
-    const trackedWallet = allAccounts.find(k => WALLETS.has(k));
+    // 2. Check if any of our tracked wallets are in this list
+    const trackedWallet = accountKeys.find(k => WALLETS.has(k));
+    
+    // DEBUG: Uncomment the line below to see every account the bot finds
+    // log(`[DEBUG] Scanned TX: Found ${accountKeys.length} accounts. Match: ${trackedWallet || 'None'}`);
 
-    if (!trackedWallet) return; // not one of our wallets
+    if (!trackedWallet) return;
 
-    // Find token mint (first non-SOL entry in postTokenBalances)
-    const postBals =
-      tx.meta?.postTokenBalances ??
-      tx.postTokenBalances ??
-      [];
+    // 3. Find token mint
+    const postBals = tx.meta?.postTokenBalances ?? tx.postTokenBalances ?? [];
+    const tokenMint = postBals.find(b => b.mint && b.mint !== SOL_MINT)?.mint;
 
-    const tokenMint = postBals.find(
-      b => b.mint && b.mint !== SOL_MINT
-    )?.mint;
-
-    if (!tokenMint) {
-      log(`[SKIP] ${trackedWallet.substring(0,8)} — no token mint in tx`);
-      return;
-    }
+    if (!tokenMint) return;
 
     const txTime = tx.blockTime ?? Math.floor(Date.now() / 1000);
     const age    = await getMintAge(tokenMint, txTime);
 
-    if (age === null) {
-      log(`[SKIP] ${trackedWallet.substring(0,8)} bought ${tokenMint.substring(0,8)} — no DexScreener data yet`);
-      return;
-    }
+    if (age === null || age < 0 || age > 60) return;
 
-    log(`[TX] ${trackedWallet.substring(0,8)} bought ${tokenMint.substring(0,8)} | age: ${age}s`);
+    log(`[MATCH] Wallet ${trackedWallet.substring(0,8)} | Token: ${tokenMint.substring(0,8)} | Age: ${age}s`);
 
-    if (age < 0 || age > 60) {
-      log(`[OLD] Token age ${age}s — skipped`);
-      return;
-    }
-
-    // Tally unique wallets for this token
     if (!activeAlerts[tokenMint]) activeAlerts[tokenMint] = new Set();
     activeAlerts[tokenMint].add(trackedWallet);
 
     const count = activeAlerts[tokenMint].size;
-    log(`[COUNT] ${count}/3 wallets hit ${tokenMint.substring(0,8)}`);
-
     if (count >= 3) {
       const msg =
         `🚨 <b>3-WALLET SIGNAL</b> 🚨\n` +
         `Token: <code>${tokenMint}</code>\n` +
-        `Age at signal: ${age}s\n` +
+        `Age at signal: ${age}s\n\n` +
         `<a href="https://dexscreener.com/solana/${tokenMint}">DexScreener</a> | ` +
         `<a href="https://solscan.io/token/${tokenMint}">Solscan</a>`;
       await sendTelegram(msg);
       delete activeAlerts[tokenMint];
     }
-
   } catch (err) {
     log(`[ERR] handleTx: ${err.message}`);
   }
@@ -214,59 +175,41 @@ async function handleTx(tx) {
 
 // ── ROUTES ────────────────────────────────────────────────────
 
-// Health check — keeps Render awake, confirms bot is running
 app.get('/', (req, res) => {
-  res.send('Wallet tracker is running.');
+  res.send('Tracker is active.');
 });
 
-// QuickNode webhook hits this endpoint
 app.post('/webhook', async (req, res) => {
-  res.sendStatus(200); // always respond fast so QuickNode doesn't retry
-
+  res.sendStatus(200); 
   const body = req.body;
-
-  // Log raw shape so we can debug if needed
-  log(`[HIT] Payload keys: ${Object.keys(body).join(', ')}`);
-  log(`[HIT] Preview: ${JSON.stringify(body).substring(0, 300)}`);
-
-  // QuickNode webhooks wrap transactions in an array at the top level
-  // or inside a "data" key — handle both
   let transactions = [];
 
+  // Correctly extract transactions from Block or Transaction payloads
   if (Array.isArray(body)) {
-    // Extract transactions from block wrapper if present
     transactions = body.flatMap(item => {
       if (item.block?.transactions) return item.block.transactions;
       if (item.transaction) return [item];
-      return [];
+      return [item]; // Fallback
     });
   } else if (body.block?.transactions) {
     transactions = body.block.transactions;
   } else if (Array.isArray(body.data)) {
     transactions = body.data;
-  } else if (body.blockTime || body.transaction) {
-    transactions = [body];
   } else {
-    log('[WARN] Unrecognised payload shape — logging full body:');
-    log(JSON.stringify(body, null, 2));
-    return;
+    transactions = [body];
   }
 
-  log(`[INFO] Processing ${transactions.length} transaction(s)`);
+  // Filter out any empty objects
+  const validTx = transactions.filter(t => t && (t.transaction || t.meta || t.accountKeys));
 
-  for (const tx of transactions) {
-    await handleTx(tx);
+  if (validTx.length > 0) {
+    for (const tx of validTx) {
+      await handleTx(tx);
+    }
   }
 });
 
-// ── START ─────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  log('==============================================');
-  log('   SOLANA WALLET TRACKER — LIVE');
-  log('==============================================');
-  log(`Watching ${WALLETS.size} wallets`);
-  log(`Webhook endpoint: POST /webhook`);
-  log(`Health check:     GET  /`);
-  log('==============================================');
+  log(`SOLANA TRACKER LIVE | Watching ${WALLETS.size} wallets`);
 });
