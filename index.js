@@ -1,7 +1,11 @@
+// ============================================================
+//  SOLANA MULTI-WALLET TRACKER
+//  Render + QuickNode Webhooks (Solana Wallet Activity Monitor)
+// ============================================================
+
 const express = require('express');
 const https   = require('https');
 const app     = express();
-
 app.use(express.json({ limit: '50mb' }));
 
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
@@ -53,124 +57,252 @@ const WALLETS = new Set([
   "HYWo71Wk9PNDe5sBaRKazPnVyGnQDiwgXCFKvgAQ1ENp",  "bwamJzztZsepfkteWRChggmXuiiCQvpLqPietdNfSXa"
 ]);
 
-let activeAlerts  = {};  
-let mintTimeCache = {};  
+// ── STATE ─────────────────────────────────────────────────────
+let activeAlerts  = {};
+let mintTimeCache = {};
 
-// Helper to log with timestamp
+// ── HELPERS ───────────────────────────────────────────────────
 function log(msg) {
-  const t = new Date().toLocaleTimeString('en-US', { hour12: false });
+  const t = new Date().toLocaleTimeString('en-US', {
+    hour12: true,
+    timeZone: 'America/Toronto'
+  });
   console.log(`[${t}] ${msg}`);
 }
 
-// Memory Cleanup: Clears cache every hour to prevent RAM issues
-setInterval(() => {
-  activeAlerts = {};
-  mintTimeCache = {};
-  log("CLEANUP: Caches cleared to save memory.");
-}, 3600000);
-
-async function getMintAge(mint, txTime) {
-  if (mintTimeCache[mint]) return txTime - mintTimeCache[mint];
-  return new Promise((resolve) => {
-    const req = https.get(`https://api.dexscreener.com/latest/dex/tokens/${mint}`, { 
-      headers: { 'User-Agent': 'Mozilla/5.0' },
-      timeout: 3000 
-    }, (res) => {
+function httpsGet(url) {
+  return new Promise((resolve, reject) => {
+    https.get(url, { headers: { 'User-Agent': 'wallet-tracker/1.0' } }, (res) => {
       let data = '';
       res.on('data', chunk => data += chunk);
       res.on('end', () => {
-        try {
-          const parsed = JSON.parse(data);
-          const created = Math.floor(parsed?.pairs?.[0]?.pairCreatedAt / 1000);
-          if (created) {
-            mintTimeCache[mint] = created;
-            resolve(txTime - created);
-          } else resolve(null);
-        } catch(e) { resolve(null); }
+        try { resolve(JSON.parse(data)); }
+        catch (e) { reject(new Error('JSON parse failed')); }
       });
-    });
-    req.on('error', () => resolve(null));
-    req.on('timeout', () => { req.destroy(); resolve(null); });
+    }).on('error', reject);
   });
 }
 
 function sendTelegram(message) {
-  const body = JSON.stringify({ chat_id: CHAT_ID, text: message, parse_mode: 'HTML' });
-  const req = https.request({
+  const body = JSON.stringify({
+    chat_id: CHAT_ID,
+    text: message,
+    parse_mode: 'HTML'
+  });
+  const options = {
     hostname: 'api.telegram.org',
     path: `/bot${TELEGRAM_TOKEN}/sendMessage`,
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) }
+    headers: {
+      'Content-Type': 'application/json',
+      'Content-Length': Buffer.byteLength(body)
+    }
+  };
+  return new Promise((resolve) => {
+    const req = https.request(options, (res) => {
+      let data = '';
+      res.on('data', c => data += c);
+      res.on('end', () => {
+        try {
+          const parsed = JSON.parse(data);
+          if (parsed.ok) log('[TG] Alert sent!');
+          else log(`[TG] Error: ${JSON.stringify(parsed)}`);
+        } catch(e) {}
+        resolve();
+      });
+    });
+    req.on('error', (e) => { log(`[TG] Request failed: ${e.message}`); resolve(); });
+    req.write(body);
+    req.end();
   });
-  req.on('error', (e) => log(`[TG ERR] ${e.message}`));
-  req.write(body);
-  req.end();
 }
 
-async function processTransaction(tx) {
+async function getMintAge(mint, txTime) {
+  if (mintTimeCache[mint] !== undefined) {
+    return txTime - mintTimeCache[mint];
+  }
   try {
-    if (!tx) return;
-    const meta = tx.meta || tx;
-    const transaction = tx.transaction || {};
-    const message = transaction.message || {};
+    const data = await httpsGet(
+      `https://api.dexscreener.com/latest/dex/tokens/${mint}`
+    );
+    const pairs = data?.pairs;
+    if (pairs && pairs.length > 0 && pairs[0].pairCreatedAt) {
+      const created = Math.floor(pairs[0].pairCreatedAt / 1000);
+      mintTimeCache[mint] = created;
+      return txTime - created;
+    }
+  } catch (e) {
+    log(`[DEX] Lookup failed for ${mint.substring(0,8)}: ${e.message}`);
+  }
+  return null;
+}
 
-    const accountKeys = [
-      ...(message.accountKeys?.map(k => k?.pubkey ?? k) ?? []),
-      ...(tx.accountKeys ?? []),
-      ...(meta.loadedAddresses?.writable ?? []),
-      ...(meta.loadedAddresses?.readonly ?? [])
-    ].filter(Boolean);
+// ── EXTRACT ALL ACCOUNT KEYS FROM A TRANSACTION ──────────────
+function extractAccounts(tx) {
+  const accounts = new Set();
 
-    const trackedWallet = accountKeys.find(k => WALLETS.has(k));
+  // Format 1: parsed webhook format — accountKeys as objects with pubkey
+  const keys1 = tx?.transaction?.message?.accountKeys;
+  if (Array.isArray(keys1)) {
+    keys1.forEach(k => {
+      const addr = k?.pubkey ?? k;
+      if (typeof addr === 'string') accounts.add(addr);
+    });
+  }
+
+  // Format 2: flat array of strings
+  const keys2 = tx?.accountKeys;
+  if (Array.isArray(keys2)) {
+    keys2.forEach(k => {
+      const addr = k?.pubkey ?? k;
+      if (typeof addr === 'string') accounts.add(addr);
+    });
+  }
+
+  // Format 3: feePayer string
+  if (typeof tx?.feePayer === 'string') accounts.add(tx.feePayer);
+
+  // Format 4: versioned transaction loaded addresses
+  const loaded = tx?.meta?.loadedAddresses;
+  if (loaded) {
+    [...(loaded.writable ?? []), ...(loaded.readonly ?? [])].forEach(k => {
+      if (typeof k === 'string') accounts.add(k);
+    });
+  }
+
+  return accounts;
+}
+
+// ── EXTRACT TOKEN MINT FROM A TRANSACTION ────────────────────
+function extractTokenMint(tx) {
+  const postBals = tx?.meta?.postTokenBalances ?? tx?.postTokenBalances ?? [];
+  for (const b of postBals) {
+    if (b?.mint && b.mint !== SOL_MINT) return b.mint;
+  }
+  const preBals = tx?.meta?.preTokenBalances ?? tx?.preTokenBalances ?? [];
+  for (const b of preBals) {
+    if (b?.mint && b.mint !== SOL_MINT) return b.mint;
+  }
+  return null;
+}
+
+// ── PROCESS ONE TRANSACTION ───────────────────────────────────
+async function handleTx(tx) {
+  try {
+    const accounts = extractAccounts(tx);
+    if (accounts.size === 0) return;
+
+    const trackedWallet = [...accounts].find(a => WALLETS.has(a));
     if (!trackedWallet) return;
 
-    const postBals = meta.postTokenBalances ?? [];
-    const tokenMint = postBals.find(b => b.mint && b.mint !== SOL_MINT)?.mint;
-    if (!tokenMint) return;
+    const tokenMint = extractTokenMint(tx);
+    if (!tokenMint) {
+      log(`[SKIP] ${trackedWallet.substring(0,8)} — no token mint found`);
+      return;
+    }
 
-    const txTime = tx.blockTime ?? Math.floor(Date.now() / 1000);
-    const age = await getMintAge(tokenMint, txTime);
+    const txTime = tx?.blockTime ?? Math.floor(Date.now() / 1000);
+    const age    = await getMintAge(tokenMint, txTime);
 
-    if (age === null || age < 0 || age > 60) return;
+    if (age === null) {
+      log(`[SKIP] ${trackedWallet.substring(0,8)} -> ${tokenMint.substring(0,8)} — no DexScreener data`);
+      return;
+    }
 
-    log(`[MATCH] Wallet: ${trackedWallet.substring(0,6)} | Token: ${tokenMint.substring(0,6)} | Age: ${age}s`);
+    log(`[TX] ${trackedWallet.substring(0,8)} bought ${tokenMint.substring(0,8)} | age: ${age}s`);
+
+    if (age < 0 || age > 60) {
+      log(`[OLD] Token age ${age}s — skipped`);
+      return;
+    }
 
     if (!activeAlerts[tokenMint]) activeAlerts[tokenMint] = new Set();
     activeAlerts[tokenMint].add(trackedWallet);
 
-    if (activeAlerts[tokenMint].size >= 3) {
-      const msg = `🚨 <b>3-WALLET SIGNAL</b> 🚨\n\nToken: <code>${tokenMint}</code>\nAge: ${age}s\n\n<a href="https://dexscreener.com/solana/${tokenMint}">DexScreener</a>`;
-      sendTelegram(msg);
+    const count = activeAlerts[tokenMint].size;
+    log(`[COUNT] ${count}/3 wallets hit ${tokenMint.substring(0,8)}`);
+
+    if (count >= 3) {
+      const msg =
+        `🚨 <b>3-WALLET SIGNAL</b> 🚨\n` +
+        `Token: <code>${tokenMint}</code>\n` +
+        `Age at signal: ${age}s\n` +
+        `<a href="https://dexscreener.com/solana/${tokenMint}">DexScreener</a> | ` +
+        `<a href="https://solscan.io/token/${tokenMint}">Solscan</a>`;
+      await sendTelegram(msg);
       delete activeAlerts[tokenMint];
     }
-  } catch (e) { log(`[ERR] Processing: ${e.message}`); }
+
+  } catch (err) {
+    log(`[ERR] handleTx: ${err.message}`);
+  }
 }
 
-app.get('/', (req, res) => res.send('Bot is Live'));
+// ── EXTRACT TRANSACTIONS FROM ANY QUICKNODE PAYLOAD ──────────
+function extractTransactions(body) {
+  // QuickNode Webhook block format:
+  // [ { block: { transactions: [...], blockTime: ... } } ]
+  if (Array.isArray(body)) {
+    const txs = body.flatMap(item => {
+      if (item?.block?.transactions) {
+        const blockTime = item.block.blockTime;
+        return item.block.transactions.map(tx => {
+          if (!tx.blockTime && blockTime) tx.blockTime = blockTime;
+          return tx;
+        });
+      }
+      if (item?.transaction || item?.meta) return [item];
+      return [];
+    });
+    if (txs.length > 0) return txs;
+  }
+
+  if (body?.block?.transactions) {
+    const blockTime = body.block.blockTime;
+    return body.block.transactions.map(tx => {
+      if (!tx.blockTime && blockTime) tx.blockTime = blockTime;
+      return tx;
+    });
+  }
+
+  if (Array.isArray(body?.data)) return body.data;
+  if (body?.transaction || body?.meta) return [body];
+
+  return [];
+}
+
+// ── ROUTES ────────────────────────────────────────────────────
+app.get('/', (req, res) => res.send('Wallet tracker is running.'));
 
 app.post('/webhook', (req, res) => {
-  // 1. TELL QUICKNODE WE GOT IT IMMEDIATELY (Prevents Termination)
-  res.sendStatus(200);
+  res.sendStatus(200); // always respond immediately
 
-  // 2. Process in background so the server stays responsive
   const body = req.body;
-  
-  const findAndProcess = (obj) => {
-    if (!obj) return;
-    if (obj.transaction && (obj.meta || obj.slot)) { 
-        processTransaction(obj); 
-        return; 
-    }
-    if (Array.isArray(obj)) { obj.forEach(findAndProcess); return; }
-    if (typeof obj === 'object') {
-      if (obj.block?.transactions) { findAndProcess(obj.block.transactions); return; }
-      if (obj.data) { findAndProcess(obj.data); return; }
-      Object.values(obj).forEach(val => { if (val && typeof val === 'object') findAndProcess(val); });
-    }
-  };
+  log(`[HIT] ${JSON.stringify(body).substring(0, 200)}`);
 
-  findAndProcess(body);
+  const transactions = extractTransactions(body);
+  log(`[INFO] Found ${transactions.length} transaction(s)`);
+
+  if (transactions.length === 0) {
+    log('[WARN] No transactions found in payload');
+    return;
+  }
+
+  // Process in background — never block the response
+  (async () => {
+    for (const tx of transactions) {
+      await handleTx(tx);
+    }
+  })();
 });
 
+// ── START ─────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => log(`STABLE TRACKER ONLINE | Port ${PORT} | ${WALLETS.size} Wallets`));
+app.listen(PORT, () => {
+  log('==============================================');
+  log('   SOLANA WALLET TRACKER — LIVE');
+  log('==============================================');
+  log(`Watching ${WALLETS.size} wallets`);
+  log('Waiting for QuickNode webhook hits...');
+  log('==============================================');
+});
