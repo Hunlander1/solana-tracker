@@ -3,7 +3,7 @@
 //  For Render + QuickNode Webhooks
 //  
 //  Set these in Render > Environment:
-//    TELEGRAM_TOKEN  = 4cebfb1a86df7efbe81712ac20b334ee
+//    TELEGRAM_TOKEN  = your bot token from BotFather
 //    CHAT_ID         = your Telegram chat ID
 // ============================================================
 
