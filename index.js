@@ -234,11 +234,18 @@ app.post('/webhook', async (req, res) => {
   let transactions = [];
 
   if (Array.isArray(body)) {
-    transactions = body;
+    // Extract transactions from block wrapper if present
+    transactions = body.flatMap(item => {
+      if (item.block?.transactions) return item.block.transactions;
+      if (item.transaction) return [item];
+      return [];
+    });
+  } else if (body.block?.transactions) {
+    transactions = body.block.transactions;
   } else if (Array.isArray(body.data)) {
     transactions = body.data;
   } else if (body.blockTime || body.transaction) {
-    transactions = [body]; // single tx object
+    transactions = [body];
   } else {
     log('[WARN] Unrecognised payload shape — logging full body:');
     log(JSON.stringify(body, null, 2));
