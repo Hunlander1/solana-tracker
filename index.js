@@ -1,7 +1,8 @@
 const express = require('express');
 const https   = require('https');
 const app     = express();
-app.use(express.json({ limit: '10mb' }));
+
+app.use(express.json({ limit: '50mb' }));
 
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
 const CHAT_ID        = process.env.CHAT_ID;
@@ -55,28 +56,42 @@ const WALLETS = new Set([
 let activeAlerts  = {};  
 let mintTimeCache = {};  
 
+// Helper to log with timestamp
 function log(msg) {
   const t = new Date().toLocaleTimeString('en-US', { hour12: false });
   console.log(`[${t}] ${msg}`);
 }
 
+// Memory Cleanup: Clears cache every hour to prevent RAM issues
+setInterval(() => {
+  activeAlerts = {};
+  mintTimeCache = {};
+  log("CLEANUP: Caches cleared to save memory.");
+}, 3600000);
+
 async function getMintAge(mint, txTime) {
   if (mintTimeCache[mint]) return txTime - mintTimeCache[mint];
-  try {
-    const res = await new Promise((resolve) => {
-      https.get(`https://api.dexscreener.com/latest/dex/tokens/${mint}`, { headers: { 'User-Agent': 'Mozilla/5.0' } }, (r) => {
-        let d = '';
-        r.on('data', c => d += c);
-        r.on('end', () => resolve(JSON.parse(d)));
-      }).on('error', () => resolve(null));
+  return new Promise((resolve) => {
+    const req = https.get(`https://api.dexscreener.com/latest/dex/tokens/${mint}`, { 
+      headers: { 'User-Agent': 'Mozilla/5.0' },
+      timeout: 3000 
+    }, (res) => {
+      let data = '';
+      res.on('data', chunk => data += chunk);
+      res.on('end', () => {
+        try {
+          const parsed = JSON.parse(data);
+          const created = Math.floor(parsed?.pairs?.[0]?.pairCreatedAt / 1000);
+          if (created) {
+            mintTimeCache[mint] = created;
+            resolve(txTime - created);
+          } else resolve(null);
+        } catch(e) { resolve(null); }
+      });
     });
-    const created = Math.floor(res?.pairs?.[0]?.pairCreatedAt / 1000);
-    if (created) {
-      mintTimeCache[mint] = created;
-      return txTime - created;
-    }
-  } catch (e) {}
-  return null;
+    req.on('error', () => resolve(null));
+    req.on('timeout', () => { req.destroy(); resolve(null); });
+  });
 }
 
 function sendTelegram(message) {
@@ -87,11 +102,12 @@ function sendTelegram(message) {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) }
   });
+  req.on('error', (e) => log(`[TG ERR] ${e.message}`));
   req.write(body);
   req.end();
 }
 
-async function handleTx(tx) {
+async function processTransaction(tx) {
   try {
     if (!tx) return;
     const meta = tx.meta || tx;
@@ -117,43 +133,44 @@ async function handleTx(tx) {
 
     if (age === null || age < 0 || age > 60) return;
 
-    log(`[MATCH] Wallet: ${trackedWallet.substring(0,8)} | Token: ${tokenMint.substring(0,8)} | Age: ${age}s`);
+    log(`[MATCH] Wallet: ${trackedWallet.substring(0,6)} | Token: ${tokenMint.substring(0,6)} | Age: ${age}s`);
 
     if (!activeAlerts[tokenMint]) activeAlerts[tokenMint] = new Set();
     activeAlerts[tokenMint].add(trackedWallet);
 
     if (activeAlerts[tokenMint].size >= 3) {
-      const msg = `🚨 <b>3-WALLET SIGNAL</b> 🚨\nToken: <code>${tokenMint}</code>\nAge: ${age}s\n\n<a href="https://dexscreener.com/solana/${tokenMint}">DexScreener</a>`;
+      const msg = `🚨 <b>3-WALLET SIGNAL</b> 🚨\n\nToken: <code>${tokenMint}</code>\nAge: ${age}s\n\n<a href="https://dexscreener.com/solana/${tokenMint}">DexScreener</a>`;
       sendTelegram(msg);
       delete activeAlerts[tokenMint];
     }
-  } catch (e) { log(`[ERR] ${e.message}`); }
+  } catch (e) { log(`[ERR] Processing: ${e.message}`); }
 }
 
-app.get('/', (req, res) => res.send('Active'));
+app.get('/', (req, res) => res.send('Bot is Live'));
 
-app.post('/webhook', async (req, res) => {
+app.post('/webhook', (req, res) => {
+  // 1. TELL QUICKNODE WE GOT IT IMMEDIATELY (Prevents Termination)
   res.sendStatus(200);
-  const body = req.body;
-  let txs = [];
 
-  // Deep extract from any nested structure
-  const findTxs = (obj) => {
+  // 2. Process in background so the server stays responsive
+  const body = req.body;
+  
+  const findAndProcess = (obj) => {
     if (!obj) return;
-    if (obj.transaction && (obj.meta || obj.slot)) { txs.push(obj); return; }
-    if (Array.isArray(obj)) { obj.forEach(findTxs); return; }
+    if (obj.transaction && (obj.meta || obj.slot)) { 
+        processTransaction(obj); 
+        return; 
+    }
+    if (Array.isArray(obj)) { obj.forEach(findAndProcess); return; }
     if (typeof obj === 'object') {
-      if (obj.block?.transactions) { findTxs(obj.block.transactions); return; }
-      if (obj.data) { findTxs(obj.data); return; }
-      Object.values(obj).forEach(val => { if (typeof val === 'object') findTxs(val); });
+      if (obj.block?.transactions) { findAndProcess(obj.block.transactions); return; }
+      if (obj.data) { findAndProcess(obj.data); return; }
+      Object.values(obj).forEach(val => { if (val && typeof val === 'object') findAndProcess(val); });
     }
   };
 
-  findTxs(body);
-  if (txs.length > 0) {
-    log(`[INFO] Found ${txs.length} transactions in payload`);
-    for (const tx of txs) await handleTx(tx);
-  }
+  findAndProcess(body);
 });
 
-app.listen(process.env.PORT || 3000, () => log(`LIVE | Watching ${WALLETS.size} wallets`));
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => log(`STABLE TRACKER ONLINE | Port ${PORT} | ${WALLETS.size} Wallets`));
