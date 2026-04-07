@@ -1,7 +1,3 @@
-// ============================================================
-//  SOLANA MULTI-WALLET TRACKER (REVISED)
-// ============================================================
-
 const express = require('express');
 const https   = require('https');
 const app     = express();
@@ -56,63 +52,26 @@ const WALLETS = new Set([
   "HYWo71Wk9PNDe5sBaRKazPnVyGnQDiwgXCFKvgAQ1ENp",  "bwamJzztZsepfkteWRChggmXuiiCQvpLqPietdNfSXa"
 ]);
 
-// ── STATE ─────────────────────────────────────────────────────
 let activeAlerts  = {};  
 let mintTimeCache = {};  
 
-// ── HELPERS ───────────────────────────────────────────────────
 function log(msg) {
   const t = new Date().toLocaleTimeString('en-US', { hour12: false });
   console.log(`[${t}] ${msg}`);
 }
 
-function httpsGet(url) {
-  return new Promise((resolve, reject) => {
-    https.get(url, { headers: { 'User-Agent': 'wallet-tracker/1.0' } }, (res) => {
-      let data = '';
-      res.on('data', chunk => data += chunk);
-      res.on('end', () => {
-        try { resolve(JSON.parse(data)); }
-        catch (e) { reject(new Error('JSON parse failed')); }
-      });
-    }).on('error', reject);
-  });
-}
-
-function sendTelegram(message) {
-  const body = JSON.stringify({
-    chat_id: CHAT_ID,
-    text: message,
-    parse_mode: 'HTML',
-    disable_web_page_preview: false
-  });
-  const options = {
-    hostname: 'api.telegram.org',
-    path: `/bot${TELEGRAM_TOKEN}/sendMessage`,
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Content-Length': Buffer.byteLength(body)
-    }
-  };
-  return new Promise((resolve) => {
-    const req = https.request(options, (res) => {
-      res.on('data', () => {});
-      res.on('end', () => resolve());
-    });
-    req.on('error', () => resolve());
-    req.write(body);
-    req.end();
-  });
-}
-
 async function getMintAge(mint, txTime) {
   if (mintTimeCache[mint]) return txTime - mintTimeCache[mint];
   try {
-    const data = await httpsGet(`https://api.dexscreener.com/latest/dex/tokens/${mint}`);
-    const pairs = data?.pairs;
-    if (pairs && pairs.length > 0 && pairs[0].pairCreatedAt) {
-      const created = Math.floor(pairs[0].pairCreatedAt / 1000);
+    const res = await new Promise((resolve) => {
+      https.get(`https://api.dexscreener.com/latest/dex/tokens/${mint}`, { headers: { 'User-Agent': 'Mozilla/5.0' } }, (r) => {
+        let d = '';
+        r.on('data', c => d += c);
+        r.on('end', () => resolve(JSON.parse(d)));
+      }).on('error', () => resolve(null));
+    });
+    const created = Math.floor(res?.pairs?.[0]?.pairCreatedAt / 1000);
+    if (created) {
       mintTimeCache[mint] = created;
       return txTime - created;
     }
@@ -120,96 +79,81 @@ async function getMintAge(mint, txTime) {
   return null;
 }
 
-// ── PROCESS ONE TRANSACTION ───────────────────────────────────
+function sendTelegram(message) {
+  const body = JSON.stringify({ chat_id: CHAT_ID, text: message, parse_mode: 'HTML' });
+  const req = https.request({
+    hostname: 'api.telegram.org',
+    path: `/bot${TELEGRAM_TOKEN}/sendMessage`,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) }
+  });
+  req.write(body);
+  req.end();
+}
+
 async function handleTx(tx) {
   try {
-    // 1. Extract ALL possible account keys (handling Legacy and V0 transactions)
+    if (!tx) return;
+    const meta = tx.meta || tx;
+    const transaction = tx.transaction || {};
+    const message = transaction.message || {};
+
     const accountKeys = [
-        ...(tx.transaction?.message?.accountKeys?.map(k => k?.pubkey ?? k) ?? []),
-        ...(tx.accountKeys ?? []),
-        ...(tx.meta?.loadedAddresses?.writable ?? []),
-        ...(tx.meta?.loadedAddresses?.readonly ?? [])
+      ...(message.accountKeys?.map(k => k?.pubkey ?? k) ?? []),
+      ...(tx.accountKeys ?? []),
+      ...(meta.loadedAddresses?.writable ?? []),
+      ...(meta.loadedAddresses?.readonly ?? [])
     ].filter(Boolean);
 
-    if (accountKeys.length === 0) return;
-
-    // 2. Check if any of our tracked wallets are in this list
     const trackedWallet = accountKeys.find(k => WALLETS.has(k));
-    
-    // DEBUG: Uncomment the line below to see every account the bot finds
-    // log(`[DEBUG] Scanned TX: Found ${accountKeys.length} accounts. Match: ${trackedWallet || 'None'}`);
-
     if (!trackedWallet) return;
 
-    // 3. Find token mint
-    const postBals = tx.meta?.postTokenBalances ?? tx.postTokenBalances ?? [];
+    const postBals = meta.postTokenBalances ?? [];
     const tokenMint = postBals.find(b => b.mint && b.mint !== SOL_MINT)?.mint;
-
     if (!tokenMint) return;
 
     const txTime = tx.blockTime ?? Math.floor(Date.now() / 1000);
-    const age    = await getMintAge(tokenMint, txTime);
+    const age = await getMintAge(tokenMint, txTime);
 
     if (age === null || age < 0 || age > 60) return;
 
-    log(`[MATCH] Wallet ${trackedWallet.substring(0,8)} | Token: ${tokenMint.substring(0,8)} | Age: ${age}s`);
+    log(`[MATCH] Wallet: ${trackedWallet.substring(0,8)} | Token: ${tokenMint.substring(0,8)} | Age: ${age}s`);
 
     if (!activeAlerts[tokenMint]) activeAlerts[tokenMint] = new Set();
     activeAlerts[tokenMint].add(trackedWallet);
 
-    const count = activeAlerts[tokenMint].size;
-    if (count >= 3) {
-      const msg =
-        `🚨 <b>3-WALLET SIGNAL</b> 🚨\n` +
-        `Token: <code>${tokenMint}</code>\n` +
-        `Age at signal: ${age}s\n\n` +
-        `<a href="https://dexscreener.com/solana/${tokenMint}">DexScreener</a> | ` +
-        `<a href="https://solscan.io/token/${tokenMint}">Solscan</a>`;
-      await sendTelegram(msg);
+    if (activeAlerts[tokenMint].size >= 3) {
+      const msg = `🚨 <b>3-WALLET SIGNAL</b> 🚨\nToken: <code>${tokenMint}</code>\nAge: ${age}s\n\n<a href="https://dexscreener.com/solana/${tokenMint}">DexScreener</a>`;
+      sendTelegram(msg);
       delete activeAlerts[tokenMint];
     }
-  } catch (err) {
-    log(`[ERR] handleTx: ${err.message}`);
-  }
+  } catch (e) { log(`[ERR] ${e.message}`); }
 }
 
-// ── ROUTES ────────────────────────────────────────────────────
-
-app.get('/', (req, res) => {
-  res.send('Tracker is active.');
-});
+app.get('/', (req, res) => res.send('Active'));
 
 app.post('/webhook', async (req, res) => {
-  res.sendStatus(200); 
+  res.sendStatus(200);
   const body = req.body;
-  let transactions = [];
+  let txs = [];
 
-  // Correctly extract transactions from Block or Transaction payloads
-  if (Array.isArray(body)) {
-    transactions = body.flatMap(item => {
-      if (item.block?.transactions) return item.block.transactions;
-      if (item.transaction) return [item];
-      return [item]; // Fallback
-    });
-  } else if (body.block?.transactions) {
-    transactions = body.block.transactions;
-  } else if (Array.isArray(body.data)) {
-    transactions = body.data;
-  } else {
-    transactions = [body];
-  }
-
-  // Filter out any empty objects
-  const validTx = transactions.filter(t => t && (t.transaction || t.meta || t.accountKeys));
-
-  if (validTx.length > 0) {
-    for (const tx of validTx) {
-      await handleTx(tx);
+  // Deep extract from any nested structure
+  const findTxs = (obj) => {
+    if (!obj) return;
+    if (obj.transaction && (obj.meta || obj.slot)) { txs.push(obj); return; }
+    if (Array.isArray(obj)) { obj.forEach(findTxs); return; }
+    if (typeof obj === 'object') {
+      if (obj.block?.transactions) { findTxs(obj.block.transactions); return; }
+      if (obj.data) { findTxs(obj.data); return; }
+      Object.values(obj).forEach(val => { if (typeof val === 'object') findTxs(val); });
     }
+  };
+
+  findTxs(body);
+  if (txs.length > 0) {
+    log(`[INFO] Found ${txs.length} transactions in payload`);
+    for (const tx of txs) await handleTx(tx);
   }
 });
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  log(`SOLANA TRACKER LIVE | Watching ${WALLETS.size} wallets`);
-});
+app.listen(process.env.PORT || 3000, () => log(`LIVE | Watching ${WALLETS.size} wallets`));
