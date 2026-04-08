@@ -1,6 +1,6 @@
 // ============================================================
 //  SOLANA MULTI-WALLET TRACKER
-//  Render + QuickNode Webhooks (Solana Wallet Activity Monitor)
+//  Render + QuickNode Webhooks + GMGN token age
 // ============================================================
 
 const express = require('express');
@@ -10,6 +10,7 @@ app.use(express.json({ limit: '50mb' }));
 
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
 const CHAT_ID        = process.env.CHAT_ID;
+const GMGN_API_KEY   = process.env.GMGN_API_KEY;
 const SOL_MINT       = 'So11111111111111111111111111111111111111112';
 
 const WALLETS = new Set([
@@ -58,8 +59,8 @@ const WALLETS = new Set([
 ]);
 
 // ── STATE ─────────────────────────────────────────────────────
-let activeAlerts  = {};
-let mintTimeCache = {};
+let activeAlerts     = {};
+let mintCreationCache = {}; // mint => creation_timestamp (unix seconds)
 
 // ── HELPERS ───────────────────────────────────────────────────
 function log(msg) {
@@ -67,33 +68,93 @@ function log(msg) {
   console.log(`[${t}] ${msg}`);
 }
 
-async function getMintAge(mint, txTime) {
-  if (mintTimeCache[mint]) return txTime - mintTimeCache[mint];
+// GMGN token info — returns creation_timestamp and other fields
+function gmgnTokenInfo(mint) {
   return new Promise((resolve) => {
-    https.get(`https://api.dexscreener.com/latest/dex/tokens/${mint}`, { headers: { 'User-Agent': 'Mozilla/5.0' } }, (res) => {
+    const timestamp = Math.floor(Date.now() / 1000);
+    const clientId  = Math.random().toString(36).substring(2) + Date.now().toString(36);
+    const params    = new URLSearchParams({
+      chain:     'sol',
+      address:   mint,
+      timestamp: timestamp.toString(),
+      client_id: clientId,
+    });
+
+    const options = {
+      hostname: 'openapi.gmgn.ai',
+      path:     `/v1/token/info?${params.toString()}`,
+      method:   'GET',
+      headers: {
+        'X-APIKEY':   GMGN_API_KEY,
+        'Accept':     'application/json',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+      }
+    };
+
+    const req = https.request(options, (res) => {
       let data = '';
       res.on('data', chunk => data += chunk);
       res.on('end', () => {
         try {
           const parsed = JSON.parse(data);
-          const created = Math.floor(parsed?.pairs?.[0]?.pairCreatedAt / 1000);
-          if (created) {
-            mintTimeCache[mint] = created;
-            resolve(txTime - created);
-          } else resolve(null);
-        } catch(e) { resolve(null); }
+          if (parsed?.code === 0 && parsed?.data) {
+            resolve(parsed.data);
+          } else {
+            log(`[GMGN] Bad response for ${mint.substring(0, 8)}: ${data.substring(0, 100)}`);
+            resolve(null);
+          }
+        } catch(e) {
+          log(`[GMGN] Parse error: ${e.message}`);
+          resolve(null);
+        }
       });
-    }).on('error', () => resolve(null));
+    });
+
+    req.on('error', (e) => {
+      log(`[GMGN] Request error: ${e.message}`);
+      resolve(null);
+    });
+
+    req.setTimeout(15000, () => {
+      log(`[GMGN] Timeout for ${mint.substring(0, 8)}`);
+      req.destroy();
+      resolve(null);
+    });
+
+    req.end();
   });
+}
+
+// Get token age in seconds using GMGN creation_timestamp
+// Returns null if we can't determine age
+async function getTokenAge(mint, txTime) {
+  // Use cached creation time if available
+  if (mintCreationCache[mint] !== undefined) {
+    return txTime - mintCreationCache[mint];
+  }
+
+  const info = await gmgnTokenInfo(mint);
+  if (!info) return null;
+
+  const creationTs = info.creation_timestamp;
+  if (!creationTs) {
+    log(`[GMGN] No creation_timestamp for ${mint.substring(0, 8)}`);
+    return null;
+  }
+
+  mintCreationCache[mint] = creationTs;
+  const age = txTime - creationTs;
+  log(`[GMGN] ${mint.substring(0, 8)} created at ${creationTs}, age: ${age}s`);
+  return age;
 }
 
 function sendTelegram(message) {
   const body = JSON.stringify({ chat_id: CHAT_ID, text: message, parse_mode: 'HTML' });
   const req = https.request({
     hostname: 'api.telegram.org',
-    path: `/bot${TELEGRAM_TOKEN}/sendMessage`,
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) }
+    path:     `/bot${TELEGRAM_TOKEN}/sendMessage`,
+    method:   'POST',
+    headers:  { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) }
   });
   req.on('error', (e) => log(`[TG ERR] ${e.message}`));
   req.write(body);
@@ -102,14 +163,12 @@ function sendTelegram(message) {
 
 async function handleTx(tx) {
   try {
-    // QuickNode wraps each transaction under a .raw key — unwrap it
     const data = tx?.raw ?? tx;
 
     const meta        = data?.meta;
     const transaction = data?.transaction || {};
     const message     = transaction?.message || {};
 
-    // Collect all account keys — supports legacy + V0 (loaded addresses)
     const accountKeys = [
       ...(message.accountKeys?.map(k => k?.pubkey ?? k) ?? []),
       ...(data?.accountKeys ?? []),
@@ -130,7 +189,7 @@ async function handleTx(tx) {
     }
 
     const txTime = data.blockTime ?? Math.floor(Date.now() / 1000);
-    const age    = await getMintAge(tokenMint, txTime);
+    const age    = await getTokenAge(tokenMint, txTime);
 
     if (age === null) {
       log(`[SKIP] Could not determine age for ${tokenMint.substring(0, 8)}`);
@@ -164,18 +223,17 @@ async function handleTx(tx) {
 app.get('/', (req, res) => res.send('Tracker Active.'));
 
 app.post('/webhook', (req, res) => {
-  res.sendStatus(200); // Always respond immediately — never keep QuickNode waiting
+  res.sendStatus(200);
 
   const body = req.body;
 
-  // QuickNode payload structure (CONFIRMED):
-  // [ { block: { blockHeight, blockTime, ... }, transactions: [ { raw: { meta, transaction } } ] } ]
-  // NOTE: transactions is a sibling of block, NOT nested inside it
+  // QuickNode payload: [ { block: { blockHeight, blockTime, ... }, transactions: [...] } ]
+  // transactions is a sibling of block, NOT nested inside it
   let txs = [];
   try {
     const blocks = Array.isArray(body) ? body : [body];
     for (const item of blocks) {
-      const transactions = item?.transactions;  // <-- FIXED: was item?.block?.transactions
+      const transactions = item?.transactions;
       if (Array.isArray(transactions)) {
         txs.push(...transactions);
       }
