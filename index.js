@@ -1,5 +1,5 @@
 // ============================================================
-//  SOLANA MULTI-WALLET TRACKER - FIXED VERSION
+//  SOLANA MULTI-WALLET TRACKER - DEBUG VERSION
 //  Render + QuickNode Webhooks (Solana Wallet Activity Monitor)
 // ============================================================
 
@@ -168,8 +168,44 @@ app.post('/webhook', (req, res) => {
 
   const body = req.body;
 
-  // QuickNode payload structure:
-  // [ { block: { transactions: [ { raw: { meta, transaction } } ] } } ]
+  // ── DEBUG: print raw payload shape ──────────────────────────
+  try {
+    const topLevelType  = Array.isArray(body) ? 'Array' : typeof body;
+    const topLevelKeys  = Array.isArray(body) ? `length=${body.length}` : Object.keys(body || {}).join(', ');
+    log(`[DEBUG] Payload type: ${topLevelType} | keys/length: ${topLevelKeys}`);
+
+    const blocks = Array.isArray(body) ? body : [body];
+
+    blocks.forEach((item, i) => {
+      const itemKeys = Object.keys(item || {}).join(', ');
+      log(`[DEBUG] blocks[${i}] keys: ${itemKeys}`);
+
+      // Print the full block object (first 800 chars) so we can see real structure
+      const blockVal = item?.block;
+      log(`[DEBUG] blocks[${i}].block => ${JSON.stringify(blockVal)?.substring(0, 800)}`);
+
+      // If block exists, show its keys and peek at first transaction
+      if (blockVal && typeof blockVal === 'object') {
+        log(`[DEBUG] blocks[${i}].block keys: ${Object.keys(blockVal).join(', ')}`);
+
+        // Try every likely transaction array key
+        const txArrayKeys = ['transactions', 'txs', 'data', 'tx'];
+        for (const key of txArrayKeys) {
+          if (Array.isArray(blockVal[key])) {
+            log(`[DEBUG] blocks[${i}].block.${key} is an Array, length=${blockVal[key].length}`);
+            if (blockVal[key].length > 0) {
+              log(`[DEBUG] blocks[${i}].block.${key}[0] keys: ${Object.keys(blockVal[key][0] || {}).join(', ')}`);
+              log(`[DEBUG] blocks[${i}].block.${key}[0] => ${JSON.stringify(blockVal[key][0])?.substring(0, 800)}`);
+            }
+          }
+        }
+      }
+    });
+  } catch(e) {
+    log(`[DEBUG ERR] ${e.message}`);
+  }
+  // ── END DEBUG ───────────────────────────────────────────────
+
   let txs = [];
   try {
     const blocks = Array.isArray(body) ? body : [body];
