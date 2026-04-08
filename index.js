@@ -1,6 +1,7 @@
 // ============================================================
 //  SOLANA MULTI-WALLET TRACKER
-//  Render + QuickNode Webhooks + GMGN token age
+//  Render + QuickNode Webhooks
+//  Signal fires when 3 wallets buy same token within 120 seconds
 // ============================================================
 
 const express = require('express');
@@ -10,8 +11,8 @@ app.use(express.json({ limit: '50mb' }));
 
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
 const CHAT_ID        = process.env.CHAT_ID;
-const GMGN_API_KEY   = process.env.GMGN_API_KEY;
 const SOL_MINT       = 'So11111111111111111111111111111111111111112';
+const WINDOW_SECS    = 120;
 
 const WALLETS = new Set([
   "CzbN6T1gKkKutvuPXcxNmV8FLqzjsDWebWmg9o8e2ZbU", "H8s4GoDcABkvykQSS7mUSHTSKUcxivoULUXgZDkjuoUf",
@@ -59,93 +60,24 @@ const WALLETS = new Set([
 ]);
 
 // ── STATE ─────────────────────────────────────────────────────
-let activeAlerts     = {};
-let mintCreationCache = {}; // mint => creation_timestamp (unix seconds)
+// activeAlerts[tokenMint] = { wallets: Set, firstSeenAt: unixSeconds }
+let activeAlerts = {};
+
+// Cleanup stale token windows every 60 seconds
+setInterval(() => {
+  const now = Math.floor(Date.now() / 1000);
+  for (const mint of Object.keys(activeAlerts)) {
+    if (now - activeAlerts[mint].firstSeenAt > WINDOW_SECS) {
+      log(`[EXPIRE] Dropping ${mint.substring(0, 8)} — window expired`);
+      delete activeAlerts[mint];
+    }
+  }
+}, 60000);
 
 // ── HELPERS ───────────────────────────────────────────────────
 function log(msg) {
   const t = new Date().toLocaleTimeString('en-US', { hour12: false });
   console.log(`[${t}] ${msg}`);
-}
-
-// GMGN token info — returns creation_timestamp and other fields
-function gmgnTokenInfo(mint) {
-  return new Promise((resolve) => {
-    const timestamp = Math.floor(Date.now() / 1000);
-    const clientId  = Math.random().toString(36).substring(2) + Date.now().toString(36);
-    const params    = new URLSearchParams({
-      chain:     'sol',
-      address:   mint,
-      timestamp: timestamp.toString(),
-      client_id: clientId,
-    });
-
-    const options = {
-      hostname: 'openapi.gmgn.ai',
-      path:     `/v1/token/info?${params.toString()}`,
-      method:   'GET',
-      headers: {
-        'X-APIKEY':   GMGN_API_KEY,
-        'Accept':     'application/json',
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-      }
-    };
-
-    const req = https.request(options, (res) => {
-      let data = '';
-      res.on('data', chunk => data += chunk);
-      res.on('end', () => {
-        try {
-          const parsed = JSON.parse(data);
-          if (parsed?.code === 0 && parsed?.data) {
-            resolve(parsed.data);
-          } else {
-            log(`[GMGN] Bad response for ${mint.substring(0, 8)}: ${data.substring(0, 100)}`);
-            resolve(null);
-          }
-        } catch(e) {
-          log(`[GMGN] Parse error: ${e.message}`);
-          resolve(null);
-        }
-      });
-    });
-
-    req.on('error', (e) => {
-      log(`[GMGN] Request error: ${e.message}`);
-      resolve(null);
-    });
-
-    req.setTimeout(15000, () => {
-      log(`[GMGN] Timeout for ${mint.substring(0, 8)}`);
-      req.destroy();
-      resolve(null);
-    });
-
-    req.end();
-  });
-}
-
-// Get token age in seconds using GMGN creation_timestamp
-// Returns null if we can't determine age
-async function getTokenAge(mint, txTime) {
-  // Use cached creation time if available
-  if (mintCreationCache[mint] !== undefined) {
-    return txTime - mintCreationCache[mint];
-  }
-
-  const info = await gmgnTokenInfo(mint);
-  if (!info) return null;
-
-  const creationTs = info.creation_timestamp;
-  if (!creationTs) {
-    log(`[GMGN] No creation_timestamp for ${mint.substring(0, 8)}`);
-    return null;
-  }
-
-  mintCreationCache[mint] = creationTs;
-  const age = txTime - creationTs;
-  log(`[GMGN] ${mint.substring(0, 8)} created at ${creationTs}, age: ${age}s`);
-  return age;
 }
 
 function sendTelegram(message) {
@@ -161,7 +93,7 @@ function sendTelegram(message) {
   req.end();
 }
 
-async function handleTx(tx) {
+function handleTx(tx) {
   try {
     const data = tx?.raw ?? tx;
 
@@ -169,6 +101,7 @@ async function handleTx(tx) {
     const transaction = data?.transaction || {};
     const message     = transaction?.message || {};
 
+    // Collect all account keys — supports legacy + V0 (loaded addresses)
     const accountKeys = [
       ...(message.accountKeys?.map(k => k?.pubkey ?? k) ?? []),
       ...(data?.accountKeys ?? []),
@@ -181,35 +114,52 @@ async function handleTx(tx) {
 
     log(`[WALLET HIT] ${trackedWallet.substring(0, 8)}...`);
 
+    // Find the token being bought — any mint that isn't native SOL
     const postBals  = meta?.postTokenBalances ?? [];
-    const tokenMint = postBals.find(b => b.mint && b.mint !== SOL_MINT)?.mint;
+    const preOwned  = new Set((meta?.preTokenBalances ?? []).map(b => b.mint));
+
+    // Prefer a mint that appears in post but not pre (newly received),
+    // falling back to any non-SOL mint in postBals
+    let tokenMint = postBals.find(b =>
+      b.mint && b.mint !== SOL_MINT && !preOwned.has(b.mint)
+    )?.mint;
+
     if (!tokenMint) {
-      log(`[SKIP] No token mint for wallet ${trackedWallet.substring(0, 8)}`);
+      tokenMint = postBals.find(b => b.mint && b.mint !== SOL_MINT)?.mint;
+    }
+
+    if (!tokenMint) {
+      log(`[SKIP] No token mint found for wallet ${trackedWallet.substring(0, 8)}`);
       return;
     }
 
-    const txTime = data.blockTime ?? Math.floor(Date.now() / 1000);
-    const age    = await getTokenAge(tokenMint, txTime);
+    const now = Math.floor(Date.now() / 1000);
 
-    if (age === null) {
-      log(`[SKIP] Could not determine age for ${tokenMint.substring(0, 8)}`);
-      return;
-    }
-    if (age < 0 || age > 60) {
-      log(`[SKIP] Token ${tokenMint.substring(0, 8)} age ${age}s outside 0-60s window`);
-      return;
+    // Initialise tracking window for this token
+    if (!activeAlerts[tokenMint]) {
+      activeAlerts[tokenMint] = { wallets: new Set(), firstSeenAt: now };
     }
 
-    log(`[TX] ${trackedWallet.substring(0, 8)} bought ${tokenMint.substring(0, 8)} | age: ${age}s`);
+    const entry = activeAlerts[tokenMint];
 
-    if (!activeAlerts[tokenMint]) activeAlerts[tokenMint] = new Set();
-    activeAlerts[tokenMint].add(trackedWallet);
+    // Check window hasn't expired since last hit
+    if (now - entry.firstSeenAt > WINDOW_SECS) {
+      log(`[RESET] ${tokenMint.substring(0, 8)} window expired — resetting`);
+      activeAlerts[tokenMint] = { wallets: new Set(), firstSeenAt: now };
+    }
 
-    const count = activeAlerts[tokenMint].size;
-    log(`[COUNT] ${count}/3 wallets hit ${tokenMint.substring(0, 8)}`);
+    entry.wallets.add(trackedWallet);
+    const count = entry.wallets.size;
+    log(`[COUNT] ${count}/3 wallets bought ${tokenMint.substring(0, 8)} within ${now - entry.firstSeenAt}s`);
 
     if (count >= 3) {
-      const msg = `🚨 <b>3-WALLET SIGNAL</b> 🚨\nToken: <code>${tokenMint}</code>\nAge: ${age}s\n\n<a href="https://dexscreener.com/solana/${tokenMint}">DexScreener</a>`;
+      const elapsed = now - entry.firstSeenAt;
+      const msg =
+        `🚨 <b>3-WALLET SIGNAL</b> 🚨\n` +
+        `Token: <code>${tokenMint}</code>\n` +
+        `3 wallets bought within ${elapsed}s\n\n` +
+        `<a href="https://dexscreener.com/solana/${tokenMint}">DexScreener</a> | ` +
+        `<a href="https://gmgn.ai/sol/token/${tokenMint}">GMGN</a>`;
       sendTelegram(msg);
       log(`[ALERT SENT] ${tokenMint}`);
       delete activeAlerts[tokenMint];
@@ -223,11 +173,11 @@ async function handleTx(tx) {
 app.get('/', (req, res) => res.send('Tracker Active.'));
 
 app.post('/webhook', (req, res) => {
-  res.sendStatus(200);
+  res.sendStatus(200); // Always respond immediately
 
   const body = req.body;
 
-  // QuickNode payload: [ { block: { blockHeight, blockTime, ... }, transactions: [...] } ]
+  // QuickNode payload: [ { block: { ... }, transactions: [ ... ] } ]
   // transactions is a sibling of block, NOT nested inside it
   let txs = [];
   try {
@@ -244,11 +194,7 @@ app.post('/webhook', (req, res) => {
 
   log(`[PAYLOAD] ${txs.length} transaction(s) in block`);
 
-  if (txs.length > 0) {
-    (async () => {
-      for (const tx of txs) await handleTx(tx);
-    })();
-  }
+  for (const tx of txs) handleTx(tx);
 });
 
 const PORT = process.env.PORT || 3000;
