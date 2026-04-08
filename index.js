@@ -60,7 +60,6 @@ const WALLETS = new Set([
 ]);
 
 // ── STATE ─────────────────────────────────────────────────────
-// activeAlerts[tokenMint] = { wallets: Set, firstSeenAt: unixSeconds }
 let activeAlerts = {};
 
 // Cleanup stale token windows every 60 seconds
@@ -87,6 +86,18 @@ function sendTelegram(message) {
     path:     `/bot${TELEGRAM_TOKEN}/sendMessage`,
     method:   'POST',
     headers:  { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) }
+  }, (res) => {
+    let resData = '';
+    res.on('data', d => resData += d);
+    res.on('end', () => {
+      try {
+        const p = JSON.parse(resData);
+        if (!p.ok) log(`[TG Error] ${p.description}`); 
+        else log(`[TG Success] Message delivered to Telegram`);
+      } catch (e) {
+        log(`[TG Error] Failed to parse response: ${resData}`);
+      }
+    });
   });
   req.on('error', (e) => log(`[TG ERR] ${e.message}`));
   req.write(body);
@@ -101,7 +112,6 @@ function handleTx(tx) {
     const transaction = data?.transaction || {};
     const message     = transaction?.message || {};
 
-    // Collect all account keys — supports legacy + V0 (loaded addresses)
     const accountKeys = [
       ...(message.accountKeys?.map(k => k?.pubkey ?? k) ?? []),
       ...(data?.accountKeys ?? []),
@@ -114,12 +124,9 @@ function handleTx(tx) {
 
     log(`[WALLET HIT] ${trackedWallet.substring(0, 8)}...`);
 
-    // Find the token being bought — any mint that isn't native SOL
     const postBals  = meta?.postTokenBalances ?? [];
     const preOwned  = new Set((meta?.preTokenBalances ?? []).map(b => b.mint));
 
-    // Prefer a mint that appears in post but not pre (newly received),
-    // falling back to any non-SOL mint in postBals
     let tokenMint = postBals.find(b =>
       b.mint && b.mint !== SOL_MINT && !preOwned.has(b.mint)
     )?.mint;
@@ -135,14 +142,12 @@ function handleTx(tx) {
 
     const now = Math.floor(Date.now() / 1000);
 
-    // Initialise tracking window for this token
     if (!activeAlerts[tokenMint]) {
       activeAlerts[tokenMint] = { wallets: new Set(), firstSeenAt: now };
     }
 
     const entry = activeAlerts[tokenMint];
 
-    // Check window hasn't expired since last hit
     if (now - entry.firstSeenAt > WINDOW_SECS) {
       log(`[RESET] ${tokenMint.substring(0, 8)} window expired — resetting`);
       activeAlerts[tokenMint] = { wallets: new Set(), firstSeenAt: now };
@@ -160,8 +165,9 @@ function handleTx(tx) {
         `3 wallets bought within ${elapsed}s\n\n` +
         `<a href="https://dexscreener.com/solana/${tokenMint}">DexScreener</a> | ` +
         `<a href="https://gmgn.ai/sol/token/${tokenMint}">GMGN</a>`;
+      
+      log(`[ALERT TRIGGERED] Attempting to send signal for ${tokenMint}`);
       sendTelegram(msg);
-      log(`[ALERT SENT] ${tokenMint}`);
       delete activeAlerts[tokenMint];
     }
   } catch (e) {
@@ -173,12 +179,9 @@ function handleTx(tx) {
 app.get('/', (req, res) => res.send('Tracker Active.'));
 
 app.post('/webhook', (req, res) => {
-  res.sendStatus(200); // Always respond immediately
+  res.sendStatus(200); 
 
   const body = req.body;
-
-  // QuickNode payload: [ { block: { ... }, transactions: [ ... ] } ]
-  // transactions is a sibling of block, NOT nested inside it
   let txs = [];
   try {
     const blocks = Array.isArray(body) ? body : [body];
@@ -192,10 +195,19 @@ app.post('/webhook', (req, res) => {
     log(`[ERR] Payload parsing: ${e.message}`);
   }
 
-  log(`[PAYLOAD] ${txs.length} transaction(s) in block`);
-
-  for (const tx of txs) handleTx(tx);
+  if (txs.length > 0) {
+    log(`[PAYLOAD] Received ${txs.length} transaction(s)`);
+    for (const tx of txs) handleTx(tx);
+  }
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => log(`SOLANA WALLET TRACKER — LIVE | Watching ${WALLETS.size} wallets`));
+app.listen(PORT, () => {
+  log(`SOLANA WALLET TRACKER — LIVE | Watching ${WALLETS.size} wallets`);
+  
+  // DIAGNOSTIC: Send a test message on startup
+  setTimeout(() => {
+    log(`[DIAGNOSTIC] Sending test message to Telegram...`);
+    sendTelegram(`<b>Bot Status:</b> Tracker is Live and listening for wallet activity.`);
+  }, 5000);
+});
