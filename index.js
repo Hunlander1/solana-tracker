@@ -1,7 +1,7 @@
 // ============================================================
 //  SOLANA MULTI-WALLET TRACKER
 //  Render + QuickNode Webhooks
-//  Signal fires when 3 wallets buy same token within 120 seconds
+//  Signal: 3 wallets buy same token within 120s, token < 1hr old
 // ============================================================
 
 const express = require('express');
@@ -11,8 +11,10 @@ app.use(express.json({ limit: '50mb' }));
 
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
 const CHAT_ID        = process.env.CHAT_ID;
+const GMGN_API_KEY   = process.env.GMGN_API_KEY;
 const SOL_MINT       = 'So11111111111111111111111111111111111111112';
 const WINDOW_SECS    = 120;
+const MAX_TOKEN_AGE  = 3600; // 1 hour in seconds
 
 const WALLETS = new Set([
   "CzbN6T1gKkKutvuPXcxNmV8FLqzjsDWebWmg9o8e2ZbU", "H8s4GoDcABkvykQSS7mUSHTSKUcxivoULUXgZDkjuoUf",
@@ -60,14 +62,18 @@ const WALLETS = new Set([
 ]);
 
 // ── STATE ─────────────────────────────────────────────────────
-let activeAlerts = {};
+// activeAlerts[mint] = { wallets: Set, firstSeenAt: unixSecs }
+let activeAlerts     = {};
+// creationCache[mint] = unixSecs — avoid repeat GMGN calls for same token
+let creationCache    = {};
+// skipCache[mint] = true — tokens confirmed older than 1hr, skip forever
+let skipCache        = {};
 
-// Cleanup stale token windows every 60 seconds
+// Cleanup stale windows every 60s
 setInterval(() => {
   const now = Math.floor(Date.now() / 1000);
   for (const mint of Object.keys(activeAlerts)) {
     if (now - activeAlerts[mint].firstSeenAt > WINDOW_SECS) {
-      log(`[EXPIRE] Dropping ${mint.substring(0, 8)} — window expired`);
       delete activeAlerts[mint];
     }
   }
@@ -77,6 +83,87 @@ setInterval(() => {
 function log(msg) {
   const t = new Date().toLocaleTimeString('en-US', { hour12: false });
   console.log(`[${t}] ${msg}`);
+}
+
+// Returns creation_timestamp (unix seconds) from GMGN, or null on failure
+function fetchCreationTimestamp(mint) {
+  return new Promise((resolve) => {
+    const timestamp = Math.floor(Date.now() / 1000);
+    const clientId  = Math.random().toString(36).substring(2) + Date.now().toString(36);
+    const params    = new URLSearchParams({
+      chain:     'sol',
+      address:   mint,
+      timestamp: timestamp.toString(),
+      client_id: clientId,
+    });
+
+    const options = {
+      hostname: 'openapi.gmgn.ai',
+      path:     `/v1/token/info?${params.toString()}`,
+      method:   'GET',
+      headers: {
+        'X-APIKEY':   GMGN_API_KEY,
+        'Accept':     'application/json',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+      }
+    };
+
+    const req = https.request(options, (res) => {
+      let data = '';
+      res.on('data', chunk => data += chunk);
+      res.on('end', () => {
+        try {
+          const parsed = JSON.parse(data);
+          if (parsed?.code === 0 && parsed?.data?.creation_timestamp) {
+            resolve(parsed.data.creation_timestamp);
+          } else {
+            log(`[GMGN] No creation_timestamp for ${mint.substring(0, 8)}: ${data.substring(0, 120)}`);
+            resolve(null);
+          }
+        } catch(e) {
+          log(`[GMGN] Parse error for ${mint.substring(0, 8)}: ${e.message}`);
+          resolve(null);
+        }
+      });
+    });
+
+    req.on('error', (e) => {
+      log(`[GMGN] Request error for ${mint.substring(0, 8)}: ${e.message}`);
+      resolve(null);
+    });
+
+    req.setTimeout(15000, () => {
+      log(`[GMGN] Timeout for ${mint.substring(0, 8)}`);
+      req.destroy();
+      resolve(null);
+    });
+
+    req.end();
+  });
+}
+
+// Returns token age in seconds, or null if unknown, or -1 if should be skipped (too old)
+async function getTokenAge(mint) {
+  const now = Math.floor(Date.now() / 1000);
+
+  if (skipCache[mint]) return -1;
+
+  if (creationCache[mint]) {
+    return now - creationCache[mint];
+  }
+
+  const createdAt = await fetchCreationTimestamp(mint);
+  if (createdAt === null) return null; // GMGN failed — don't skip, let it through
+
+  creationCache[mint] = createdAt;
+  const age = now - createdAt;
+
+  if (age > MAX_TOKEN_AGE) {
+    skipCache[mint] = true;
+    return -1;
+  }
+
+  return age;
 }
 
 function sendTelegram(message) {
@@ -92,10 +179,10 @@ function sendTelegram(message) {
     res.on('end', () => {
       try {
         const p = JSON.parse(resData);
-        if (!p.ok) log(`[TG Error] ${p.description}`); 
-        else log(`[TG Success] Message delivered to Telegram`);
-      } catch (e) {
-        log(`[TG Error] Failed to parse response: ${resData}`);
+        if (!p.ok) log(`[TG Error] ${p.description}`);
+        else log(`[TG Success] Message delivered`);
+      } catch(e) {
+        log(`[TG Error] Failed to parse response`);
       }
     });
   });
@@ -104,7 +191,7 @@ function sendTelegram(message) {
   req.end();
 }
 
-function handleTx(tx) {
+async function handleTx(tx) {
   try {
     const data = tx?.raw ?? tx;
 
@@ -112,6 +199,7 @@ function handleTx(tx) {
     const transaction = data?.transaction || {};
     const message     = transaction?.message || {};
 
+    // Collect all account keys — supports legacy + V0 loaded addresses
     const accountKeys = [
       ...(message.accountKeys?.map(k => k?.pubkey ?? k) ?? []),
       ...(data?.accountKeys ?? []),
@@ -124,8 +212,9 @@ function handleTx(tx) {
 
     log(`[WALLET HIT] ${trackedWallet.substring(0, 8)}...`);
 
-    const postBals  = meta?.postTokenBalances ?? [];
-    const preOwned  = new Set((meta?.preTokenBalances ?? []).map(b => b.mint));
+    // Find token being bought — prefer mint new to this wallet (in post but not pre)
+    const postBals = meta?.postTokenBalances ?? [];
+    const preOwned = new Set((meta?.preTokenBalances ?? []).map(b => b.mint));
 
     let tokenMint = postBals.find(b =>
       b.mint && b.mint !== SOL_MINT && !preOwned.has(b.mint)
@@ -140,6 +229,24 @@ function handleTx(tx) {
       return;
     }
 
+    // ── TOKEN AGE CHECK via GMGN ──────────────────────────────
+    // Only call GMGN once per unique mint (cached after first call)
+    const age = await getTokenAge(tokenMint);
+
+    if (age === -1) {
+      log(`[SKIP] ${tokenMint.substring(0, 8)} is older than 1hr`);
+      return;
+    }
+
+    if (age === null) {
+      // GMGN couldn't answer — let it through rather than silently dropping
+      log(`[WARN] Could not verify age for ${tokenMint.substring(0, 8)} — allowing through`);
+    } else {
+      const ageStr = age < 60 ? `${age}s` : `${Math.floor(age / 60)}m ${age % 60}s`;
+      log(`[AGE OK] ${tokenMint.substring(0, 8)} is ${ageStr} old`);
+    }
+
+    // ── 120s COORDINATION WINDOW ─────────────────────────────
     const now = Math.floor(Date.now() / 1000);
 
     if (!activeAlerts[tokenMint]) {
@@ -148,6 +255,7 @@ function handleTx(tx) {
 
     const entry = activeAlerts[tokenMint];
 
+    // Reset window if it expired between hits
     if (now - entry.firstSeenAt > WINDOW_SECS) {
       log(`[RESET] ${tokenMint.substring(0, 8)} window expired — resetting`);
       activeAlerts[tokenMint] = { wallets: new Set(), firstSeenAt: now };
@@ -158,15 +266,17 @@ function handleTx(tx) {
     log(`[COUNT] ${count}/3 wallets bought ${tokenMint.substring(0, 8)} within ${now - entry.firstSeenAt}s`);
 
     if (count >= 3) {
-      const elapsed = now - entry.firstSeenAt;
+      const elapsed  = now - entry.firstSeenAt;
+      const ageLabel = age !== null ? (age < 60 ? `${age}s` : `${Math.floor(age / 60)}m ${age % 60}s`) : 'unknown';
       const msg =
         `🚨 <b>3-WALLET SIGNAL</b> 🚨\n` +
         `Token: <code>${tokenMint}</code>\n` +
+        `Token Age: ${ageLabel}\n` +
         `3 wallets bought within ${elapsed}s\n\n` +
         `<a href="https://dexscreener.com/solana/${tokenMint}">DexScreener</a> | ` +
         `<a href="https://gmgn.ai/sol/token/${tokenMint}">GMGN</a>`;
-      
-      log(`[ALERT TRIGGERED] Attempting to send signal for ${tokenMint}`);
+
+      log(`[ALERT] Sending signal for ${tokenMint.substring(0, 8)}`);
       sendTelegram(msg);
       delete activeAlerts[tokenMint];
     }
@@ -179,7 +289,7 @@ function handleTx(tx) {
 app.get('/', (req, res) => res.send('Tracker Active.'));
 
 app.post('/webhook', (req, res) => {
-  res.sendStatus(200); 
+  res.sendStatus(200); // Always respond immediately
 
   const body = req.body;
   let txs = [];
@@ -196,18 +306,14 @@ app.post('/webhook', (req, res) => {
   }
 
   if (txs.length > 0) {
-    log(`[PAYLOAD] Received ${txs.length} transaction(s)`);
-    for (const tx of txs) handleTx(tx);
+    log(`[PAYLOAD] ${txs.length} transaction(s)`);
+    (async () => {
+      for (const tx of txs) await handleTx(tx);
+    })();
   }
 });
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   log(`SOLANA WALLET TRACKER — LIVE | Watching ${WALLETS.size} wallets`);
-  
-  // DIAGNOSTIC: Send a test message on startup
-  setTimeout(() => {
-    log(`[DIAGNOSTIC] Sending test message to Telegram...`);
-    sendTelegram(`<b>Bot Status:</b> Tracker is Live and listening for wallet activity.`);
-  }, 5000);
 });
