@@ -1,5 +1,5 @@
 // ============================================================
-//  SOLANA MULTI-WALLET TRACKER - DEBUG VERSION
+//  SOLANA MULTI-WALLET TRACKER - FIXED VERSION
 //  Render + QuickNode Webhooks (Solana Wallet Activity Monitor)
 // ============================================================
 
@@ -102,13 +102,17 @@ function sendTelegram(message) {
 
 async function handleTx(tx) {
   try {
-    const meta = tx?.meta || tx;
-    const transaction = tx?.transaction || {};
-    const message = transaction?.message || {};
+    // QuickNode wraps each transaction under a .raw key — unwrap it
+    const data = tx?.raw ?? tx;
 
+    const meta        = data?.meta;
+    const transaction = data?.transaction || {};
+    const message     = transaction?.message || {};
+
+    // Collect all account keys — supports legacy + V0 (loaded addresses)
     const accountKeys = [
       ...(message.accountKeys?.map(k => k?.pubkey ?? k) ?? []),
-      ...(tx?.accountKeys ?? []),
+      ...(data?.accountKeys ?? []),
       ...(meta?.loadedAddresses?.writable ?? []),
       ...(meta?.loadedAddresses?.readonly ?? [])
     ].filter(Boolean);
@@ -116,85 +120,75 @@ async function handleTx(tx) {
     const trackedWallet = accountKeys.find(a => WALLETS.has(a));
     if (!trackedWallet) return;
 
-    const postBals = meta?.postTokenBalances ?? [];
+    log(`[WALLET HIT] ${trackedWallet.substring(0, 8)}...`);
+
+    const postBals  = meta?.postTokenBalances ?? [];
     const tokenMint = postBals.find(b => b.mint && b.mint !== SOL_MINT)?.mint;
-    if (!tokenMint) return;
+    if (!tokenMint) {
+      log(`[SKIP] No token mint for wallet ${trackedWallet.substring(0, 8)}`);
+      return;
+    }
 
-    const txTime = tx.blockTime ?? Math.floor(Date.now() / 1000);
-    const age = await getMintAge(tokenMint, txTime);
+    const txTime = data.blockTime ?? Math.floor(Date.now() / 1000);
+    const age    = await getMintAge(tokenMint, txTime);
 
-    if (age === null || age < 0 || age > 60) return;
+    if (age === null) {
+      log(`[SKIP] Could not determine age for ${tokenMint.substring(0, 8)}`);
+      return;
+    }
+    if (age < 0 || age > 60) {
+      log(`[SKIP] Token ${tokenMint.substring(0, 8)} age ${age}s outside 0-60s window`);
+      return;
+    }
 
-    log(`[TX] ${trackedWallet.substring(0,8)} bought ${tokenMint.substring(0,8)} | age: ${age}s`);
+    log(`[TX] ${trackedWallet.substring(0, 8)} bought ${tokenMint.substring(0, 8)} | age: ${age}s`);
 
     if (!activeAlerts[tokenMint]) activeAlerts[tokenMint] = new Set();
     activeAlerts[tokenMint].add(trackedWallet);
 
     const count = activeAlerts[tokenMint].size;
-    log(`[COUNT] ${count}/3 wallets hit ${tokenMint.substring(0,8)}`);
+    log(`[COUNT] ${count}/3 wallets hit ${tokenMint.substring(0, 8)}`);
 
     if (count >= 3) {
       const msg = `🚨 <b>3-WALLET SIGNAL</b> 🚨\nToken: <code>${tokenMint}</code>\nAge: ${age}s\n\n<a href="https://dexscreener.com/solana/${tokenMint}">DexScreener</a>`;
       sendTelegram(msg);
+      log(`[ALERT SENT] ${tokenMint}`);
       delete activeAlerts[tokenMint];
     }
-  } catch (e) { log(`[ERR] handleTx: ${e.message}`); }
+  } catch (e) {
+    log(`[ERR] handleTx: ${e.message}`);
+  }
 }
 
 // ── ROUTES ────────────────────────────────────────────────────
 app.get('/', (req, res) => res.send('Tracker Active.'));
 
 app.post('/webhook', (req, res) => {
-  res.sendStatus(200); // Immediate acknowledgment
+  res.sendStatus(200); // Always respond immediately — never keep QuickNode waiting
 
   const body = req.body;
 
-  // ── DEBUG: log payload structure so we can see what QuickNode is sending ──
+  // QuickNode payload structure:
+  // [ { block: { transactions: [ { raw: { meta, transaction } } ] } } ]
+  let txs = [];
   try {
-    const topKeys = Object.keys(body || {});
-    log(`[DEBUG] Top-level keys: ${JSON.stringify(topKeys)}`);
-
-    if (body?.block) {
-      const blockKeys = Object.keys(body.block);
-      log(`[DEBUG] block keys: ${JSON.stringify(blockKeys)}`);
-      const txs = body?.block?.transactions;
-      log(`[DEBUG] block.transactions type: ${typeof txs}, length: ${Array.isArray(txs) ? txs.length : 'N/A'}`);
-      if (Array.isArray(txs) && txs.length > 0) {
-        log(`[DEBUG] First tx keys: ${JSON.stringify(Object.keys(txs[0]))}`);
-        if (txs[0]?.transaction) {
-          log(`[DEBUG] First tx.transaction keys: ${JSON.stringify(Object.keys(txs[0].transaction))}`);
-        }
-        if (txs[0]?.meta) {
-          log(`[DEBUG] First tx.meta keys: ${JSON.stringify(Object.keys(txs[0].meta))}`);
-        }
+    const blocks = Array.isArray(body) ? body : [body];
+    for (const item of blocks) {
+      const transactions = item?.block?.transactions;
+      if (Array.isArray(transactions)) {
+        txs.push(...transactions);
       }
-    } else {
-      // No block wrapper — log full structure (truncated)
-      const sample = JSON.stringify(body).substring(0, 500);
-      log(`[DEBUG] No block key. Raw sample: ${sample}`);
     }
   } catch(e) {
-    log(`[DEBUG ERR] ${e.message}`);
+    log(`[ERR] Payload parsing: ${e.message}`);
   }
 
-  // ── EXTRACT transactions ──
-  let txs = [];
-  const extract = (obj) => {
-    if (!obj) return;
-    if (obj.transaction && (obj.meta || obj.slot)) { txs.push(obj); return; }
-    if (Array.isArray(obj)) { obj.forEach(extract); return; }
-    if (typeof obj === 'object') {
-      if (obj.block?.transactions) { extract(obj.block.transactions); return; }
-      if (obj.data) { extract(obj.data); return; }
-      Object.values(obj).forEach(val => { if (val && typeof val === 'object') extract(val); });
-    }
-  };
-
-  extract(body);
-  log(`[DEBUG] Extracted ${txs.length} transactions after parsing`);
+  log(`[PAYLOAD] ${txs.length} transaction(s) in block`);
 
   if (txs.length > 0) {
-    (async () => { for (const tx of txs) await handleTx(tx); })();
+    (async () => {
+      for (const tx of txs) await handleTx(tx);
+    })();
   }
 });
 
