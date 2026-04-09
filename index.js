@@ -3,12 +3,12 @@
 //  Render + QuickNode Webhook (solanaWalletFilter template)
 //  Active: 11:00 AM - 6:00 PM Eastern Time only
 //  Signal: 3 wallets buy same token within 120s, token < 1hr old
-//  Each token contract fires ONE signal only
+//  Each token contract fires ONE signal only (persisted to disk)
 // ============================================================
 
 const express = require('express');
-const https   = require('express');
-const https   = require('https');
+const https   = require('https');   // FIXED: was accidentally set to require('express')
+const fs      = require('fs');
 const app     = express();
 app.use(express.json({ limit: '50mb' }));
 
@@ -18,6 +18,30 @@ const GMGN_API_KEY   = process.env.GMGN_API_KEY;
 const SOL_MINT       = 'So11111111111111111111111111111111111111112';
 const WINDOW_SECS    = 120;
 const MAX_TOKEN_AGE  = 3600;
+
+// ── FIRED ALERTS (file-backed, survives restarts) ─────────────
+const FIRED_FILE = '/tmp/fired_alerts.json';
+
+function loadFiredAlerts() {
+  try {
+    if (fs.existsSync(FIRED_FILE)) {
+      const raw = fs.readFileSync(FIRED_FILE, 'utf8');
+      return new Set(JSON.parse(raw));
+    }
+  } catch(e) {
+    log(`[INIT] Could not load fired alerts file: ${e.message}`);
+  }
+  return new Set();
+}
+
+function saveFiredAlert(mint) {
+  firedAlerts.add(mint);
+  try {
+    fs.writeFileSync(FIRED_FILE, JSON.stringify([...firedAlerts]), 'utf8');
+  } catch(e) {
+    log(`[WARN] Could not save fired alert: ${e.message}`);
+  }
+}
 
 const WALLETS = new Set([
   "CzbN6T1gKkKutvuPXcxNmV8FLqzjsDWebWmg9o8e2ZbU", "H8s4GoDcABkvykQSS7mUSHTSKUcxivoULUXgZDkjuoUf",
@@ -65,10 +89,12 @@ const WALLETS = new Set([
 ]);
 
 // ── STATE ─────────────────────────────────────────────────────
-let activeAlerts  = {};   // tokenMint => { wallets: Set, firstSeenAt }
-let firedAlerts   = new Set(); // tokens that already triggered a signal — never re-fire
-let creationCache = {};   // tokenMint => creation_timestamp
-let skipCache     = {};   // tokenMint => true if confirmed > 1hr old
+let activeAlerts  = {};
+let firedAlerts   = loadFiredAlerts();   // loaded from disk on startup
+let creationCache = {};
+let skipCache     = {};
+
+log(`[INIT] Loaded ${firedAlerts.size} previously fired contracts from disk`);
 
 // Cleanup stale windows every 60s
 setInterval(() => {
@@ -97,71 +123,15 @@ function log(msg) {
   console.log(`[${t}] ${msg}`);
 }
 
-// ── GMGN ──────────────────────────────────────────────────────
-function gmgnGet(path, params = {}) {
+function httpsGet(hostname, path, headers = {}) {
   return new Promise((resolve) => {
-    params.timestamp = Math.floor(Date.now() / 1000).toString();
-    params.client_id = Math.random().toString(36).substring(2) + Date.now().toString(36);
-    const query   = new URLSearchParams(params).toString();
-    const options = {
-      hostname: 'openapi.gmgn.ai',
-      path:     `${path}?${query}`,
-      method:   'GET',
-      headers: {
-        'X-APIKEY':   GMGN_API_KEY,
-        'Accept':     'application/json',
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-      }
-    };
+    const options = { hostname, path, method: 'GET', headers };
     const req = https.request(options, (res) => {
       let data = '';
       res.on('data', chunk => data += chunk);
       res.on('end', () => {
-        try {
-          const parsed = JSON.parse(data);
-          if (parsed?.code === 0 && parsed?.data) resolve(parsed.data);
-          else { log(`[GMGN] Error ${path}: ${data.substring(0, 100)}`); resolve(null); }
-        } catch(e) { log(`[GMGN] Parse error: ${e.message}`); resolve(null); }
-      });
-    });
-    req.on('error', (e) => { log(`[GMGN] ${e.message}`); resolve(null); });
-    req.setTimeout(15000, () => { req.destroy(); resolve(null); });
-    req.end();
-  });
-}
-
-async function fetchTokenInfo(mint) {
-  return await gmgnGet('/v1/token/info', { chain: 'sol', address: mint });
-}
-
-async function fetchFreshWallets(mint) {
-  const data = await gmgnGet('/v1/token/security', { chain: 'sol', address: mint });
-  if (!data) return null;
-  return data.fresh_holder_count ?? data.fresh_wallet_count ?? null;
-}
-
-function fetchSameNameCount(symbol) {
-  return new Promise((resolve) => {
-    const options = {
-      hostname: 'api.dexscreener.com',
-      path:     `/latest/dex/search?q=${encodeURIComponent(symbol)}`,
-      method:   'GET',
-      headers:  { 'User-Agent': 'Mozilla/5.0', 'Accept': 'application/json' }
-    };
-    const req = https.request(options, (res) => {
-      let data = '';
-      res.on('data', chunk => data += chunk);
-      res.on('end', () => {
-        try {
-          const parsed = JSON.parse(data);
-          const pairs  = parsed?.pairs ?? [];
-          const nowMs  = Date.now();
-          const cutoff = 5 * 3600 * 1000;
-          const count  = pairs.filter(p =>
-            p.chainId === 'solana' && p.pairCreatedAt && nowMs - p.pairCreatedAt <= cutoff
-          ).length;
-          resolve(count);
-        } catch(e) { resolve(null); }
+        try { resolve(JSON.parse(data)); }
+        catch(e) { resolve(null); }
       });
     });
     req.on('error', () => resolve(null));
@@ -170,6 +140,68 @@ function fetchSameNameCount(symbol) {
   });
 }
 
+// ── GMGN ──────────────────────────────────────────────────────
+async function gmgnGet(path, params = {}) {
+  params.timestamp = Math.floor(Date.now() / 1000).toString();
+  params.client_id = Math.random().toString(36).substring(2) + Date.now().toString(36);
+  const query = new URLSearchParams(params).toString();
+  const fullPath = `${path}?${query}`;
+  const headers = {
+    'X-APIKEY':   GMGN_API_KEY,
+    'Accept':     'application/json',
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+  };
+
+  const parsed = await httpsGet('openapi.gmgn.ai', fullPath, headers);
+  if (parsed?.code === 0 && parsed?.data) return parsed.data;
+  log(`[GMGN] Error ${path}: ${JSON.stringify(parsed)?.substring(0, 100)}`);
+  return null;
+}
+
+async function fetchTokenInfo(mint) {
+  return await gmgnGet('/v1/token/info', { chain: 'sol', address: mint });
+}
+
+async function fetchFreshWallets(mint) {
+  const data = await gmgnGet('/v1/token/security', { chain: 'sol', address: mint });
+  if (!data) {
+    log(`[GMGN] Security endpoint returned null for ${mint.substring(0, 8)}`);
+    return null;
+  }
+  // Log all keys so we can see exactly what GMGN returns
+  log(`[GMGN] Security keys for ${mint.substring(0, 8)}: ${Object.keys(data).join(', ')}`);
+  // Try every known field name variant
+  return data.fresh_holder_count
+      ?? data.fresh_wallet_count
+      ?? data.fresh_holders
+      ?? data.freshHolder
+      ?? null;
+}
+
+// ── DEXSCREENER (with retries, matching Python version) ───────
+async function fetchSameNameCount(symbol) {
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const parsed = await httpsGet(
+      'api.dexscreener.com',
+      `/latest/dex/search?q=${encodeURIComponent(symbol)}`,
+      { 'User-Agent': 'Mozilla/5.0', 'Accept': 'application/json' }
+    );
+    if (parsed) {
+      const pairs  = parsed?.pairs ?? [];
+      const nowMs  = Date.now();
+      const cutoff = 5 * 3600 * 1000;
+      const count  = pairs.filter(p =>
+        p.chainId === 'solana' && p.pairCreatedAt && nowMs - p.pairCreatedAt <= cutoff
+      ).length;
+      return count;
+    }
+    log(`[Dex] attempt ${attempt + 1} failed for ${symbol}, retrying...`);
+    await new Promise(r => setTimeout(r, 5000));
+  }
+  return null;
+}
+
+// ── TOKEN AGE ─────────────────────────────────────────────────
 async function getTokenAge(mint) {
   const now = Math.floor(Date.now() / 1000);
   if (skipCache[mint]) return -1;
@@ -187,12 +219,13 @@ async function getTokenAge(mint) {
 // ── TELEGRAM ──────────────────────────────────────────────────
 function sendTelegram(message) {
   const body = JSON.stringify({ chat_id: CHAT_ID, text: message, parse_mode: 'HTML' });
-  const req  = https.request({
+  const options = {
     hostname: 'api.telegram.org',
     path:     `/bot${TELEGRAM_TOKEN}/sendMessage`,
     method:   'POST',
     headers:  { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) }
-  }, (res) => {
+  };
+  const req = https.request(options, (res) => {
     let d = '';
     res.on('data', c => d += c);
     res.on('end', () => {
@@ -303,19 +336,16 @@ async function handleTx(tx) {
       return;
     }
 
-    // Never re-fire a token that already triggered a signal
     if (firedAlerts.has(tokenMint)) {
       log(`[SKIP] ${tokenMint.substring(0, 8)} already signalled`);
       return;
     }
 
-    // Token age check
     const age = await getTokenAge(tokenMint);
     if (age === -1) { log(`[SKIP] ${tokenMint.substring(0, 8)} older than 1hr`); return; }
     if (age === null) log(`[WARN] Age unknown for ${tokenMint.substring(0, 8)} — allowing through`);
     else log(`[AGE] ${tokenMint.substring(0, 8)} is ${age < 60 ? age + 's' : Math.floor(age/60) + 'm ' + age%60 + 's'} old`);
 
-    // 120s coordination window
     const now = Math.floor(Date.now() / 1000);
 
     if (!activeAlerts[tokenMint]) {
@@ -335,8 +365,8 @@ async function handleTx(tx) {
 
     if (count >= 3) {
       const elapsed = now - entry.firstSeenAt;
-      firedAlerts.add(tokenMint);       // block all future signals for this token
-      delete activeAlerts[tokenMint];   // clean up window
+      saveFiredAlert(tokenMint);      // persist to disk immediately
+      delete activeAlerts[tokenMint];
       const tokenInfo = await fetchTokenInfo(tokenMint);
       await buildAndSendSignal(tokenMint, count, elapsed, tokenInfo);
     }
