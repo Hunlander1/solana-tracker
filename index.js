@@ -1,23 +1,45 @@
 // ============================================================
-//  SOLANA MULTI-WALLET TRACKER
-//  Render + QuickNode Webhook (solanaWalletFilter template)
-//  Active: 11:00 AM - 6:00 PM Eastern Time only
-//  Signal: 3 wallets buy same token within 120s, token < 1hr old
-//  Each token contract fires ONE signal only (persisted to disk)
+//  SOLANA MULTI-WALLET TRACKER — WEBSOCKET EDITION
+//  Zero credits. No webhook provider. Runs forever for free.
+//
+//  How it works:
+//  - Opens a persistent WebSocket to a free Solana RPC
+//  - Subscribes to logsSubscribe for each of the 84 wallets
+//  - When a wallet transacts, Solana pushes the signature
+//  - We fetch the full transaction to extract the token mint
+//  - Coordination logic + GMGN enrichment + Telegram signal
+//
+//  Render setup:
+//  - Change service type from "Web Service" to "Background Worker"
+//    (or keep as Web Service — the /health route keeps it alive)
+//  - Environment vars: TELEGRAM_TOKEN, CHAT_ID, GMGN_API_KEY,
+//                      SHYFT_API_KEY (your free Shyft key for WSS)
 // ============================================================
 
-const express = require('express');
-const https   = require('https');   // FIXED: was accidentally set to require('express')
+const https   = require('https');
+const http    = require('http');
 const fs      = require('fs');
-const app     = express();
-app.use(express.json({ limit: '50mb' }));
+const WebSocket = require('ws');
 
+// ── CONFIG ────────────────────────────────────────────────────
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
 const CHAT_ID        = process.env.CHAT_ID;
 const GMGN_API_KEY   = process.env.GMGN_API_KEY;
-const SOL_MINT       = 'So11111111111111111111111111111111111111112';
-const WINDOW_SECS    = 120;
-const MAX_TOKEN_AGE  = 3600;
+const SHYFT_API_KEY  = process.env.SHYFT_API_KEY;  // free Shyft key for WSS
+
+const SOL_MINT     = 'So11111111111111111111111111111111111111112';
+const WINDOW_SECS  = 120;
+const MAX_TOKEN_AGE = 3600;
+
+// WSS endpoints — primary is Shyft (free, unlimited RPC), fallback is public Solana
+// HTTP RPC for getTransaction calls
+const WSS_PRIMARY   = SHYFT_API_KEY
+  ? `wss://rpc.shyft.to?api_key=${SHYFT_API_KEY}`
+  : 'wss://api.mainnet-beta.solana.com';
+const WSS_FALLBACK  = 'wss://api.mainnet-beta.solana.com';
+const HTTP_RPC      = SHYFT_API_KEY
+  ? `https://rpc.shyft.to?api_key=${SHYFT_API_KEY}`
+  : 'https://api.mainnet-beta.solana.com';
 
 // ── FIRED ALERTS (file-backed, survives restarts) ─────────────
 const FIRED_FILE = '/tmp/fired_alerts.json';
@@ -28,22 +50,18 @@ function loadFiredAlerts() {
       const raw = fs.readFileSync(FIRED_FILE, 'utf8');
       return new Set(JSON.parse(raw));
     }
-  } catch(e) {
-    log(`[INIT] Could not load fired alerts file: ${e.message}`);
-  }
+  } catch(e) { log(`[INIT] Could not load fired alerts: ${e.message}`); }
   return new Set();
 }
 
 function saveFiredAlert(mint) {
   firedAlerts.add(mint);
-  try {
-    fs.writeFileSync(FIRED_FILE, JSON.stringify([...firedAlerts]), 'utf8');
-  } catch(e) {
-    log(`[WARN] Could not save fired alert: ${e.message}`);
-  }
+  try { fs.writeFileSync(FIRED_FILE, JSON.stringify([...firedAlerts]), 'utf8'); }
+  catch(e) { log(`[WARN] Could not save fired alert: ${e.message}`); }
 }
 
-const WALLETS = new Set([
+// ── WALLETS ───────────────────────────────────────────────────
+const WALLETS = [
   "CzbN6T1gKkKutvuPXcxNmV8FLqzjsDWebWmg9o8e2ZbU", "H8s4GoDcABkvykQSS7mUSHTSKUcxivoULUXgZDkjuoUf",
   "AmNMqM5VbPwtG14gLBdtrqZpQrhSzavLkQPufS8CQ7LB", "AMRsSeU5JpqwQWJGNLMpZzRCZSFEwYQYbMnms3dD4311",
   "2bBRwhGoL4fRZk6g8NnhBZywsF8PdLJnBRfWDCEMogD2", "6EDaVsS6enYgJ81tmhEkiKFcb4HuzPUVFZeom6PHUqN3",
@@ -86,33 +104,30 @@ const WALLETS = new Set([
   "FgifQEkRkSSXZjf2cJ4c55BhVts2yrNKzmzBLLyicg8b", "EFaQQTGywnD4CjQQvTugUiyVT4LV9G6MsWqiub8X6unN",
   "HUgpmqL6r4Z4iEZiVuNZ6J6QnAsSZpsL8giVyVtz3QhT", "FaBGrHWjcJ8vKnbgUtsdpZjvF7YAAajtQTWmmEHiKtQr",
   "HYWo71Wk9PNDe5sBaRKazPnVyGnQDiwgXCFKvgAQ1ENp", "bwamJzztZsepfkteWRChggmXuiiCQvpLqPietdNfSXa"
-]);
+];
+const WALLET_SET = new Set(WALLETS);
 
 // ── STATE ─────────────────────────────────────────────────────
-let activeAlerts  = {};
-let firedAlerts   = loadFiredAlerts();   // loaded from disk on startup
+let firedAlerts   = loadFiredAlerts();
+let activeAlerts  = {};   // tokenMint => { wallets: Set, firstSeenAt }
 let creationCache = {};
 let skipCache     = {};
+let subIdToWallet = {};   // subscription id => wallet address
+let ws            = null;
+let wsReady       = false;
+let reconnectDelay = 5000;
+let usingFallback  = false;
+let pendingSigs    = new Set(); // debounce: avoid fetching same sig twice
 
-log(`[INIT] Loaded ${firedAlerts.size} previously fired contracts from disk`);
+log(`[INIT] Loaded ${firedAlerts.size} previously fired contracts`);
 
 // Cleanup stale windows every 60s
 setInterval(() => {
   const now = Math.floor(Date.now() / 1000);
   for (const mint of Object.keys(activeAlerts)) {
-    if (now - activeAlerts[mint].firstSeenAt > WINDOW_SECS) {
-      delete activeAlerts[mint];
-    }
+    if (now - activeAlerts[mint].firstSeenAt > WINDOW_SECS) delete activeAlerts[mint];
   }
 }, 60000);
-
-// ── TIME GATE ─────────────────────────────────────────────────
-function isActiveHours() {
-  const now     = new Date();
-  const eastern = new Date(now.toLocaleString('en-US', { timeZone: 'America/New_York' }));
-  const val     = eastern.getHours() * 60 + eastern.getMinutes();
-  return val >= 660 && val < 1080; // 11:00am–6:00pm ET
-}
 
 // ── HELPERS ───────────────────────────────────────────────────
 function log(msg) {
@@ -123,16 +138,21 @@ function log(msg) {
   console.log(`[${t}] ${msg}`);
 }
 
+function isActiveHours() {
+  const now     = new Date();
+  const eastern = new Date(now.toLocaleString('en-US', { timeZone: 'America/New_York' }));
+  const val     = eastern.getHours() * 60 + eastern.getMinutes();
+  return val >= 660 && val < 1080; // 11am–6pm ET
+}
+
+// ── HTTP HELPERS ──────────────────────────────────────────────
 function httpsGet(hostname, path, headers = {}) {
   return new Promise((resolve) => {
     const options = { hostname, path, method: 'GET', headers };
     const req = https.request(options, (res) => {
       let data = '';
-      res.on('data', chunk => data += chunk);
-      res.on('end', () => {
-        try { resolve(JSON.parse(data)); }
-        catch(e) { resolve(null); }
-      });
+      res.on('data', c => data += c);
+      res.on('end', () => { try { resolve(JSON.parse(data)); } catch { resolve(null); } });
     });
     req.on('error', () => resolve(null));
     req.setTimeout(15000, () => { req.destroy(); resolve(null); });
@@ -140,19 +160,73 @@ function httpsGet(hostname, path, headers = {}) {
   });
 }
 
+function httpsPost(url, body) {
+  return new Promise((resolve) => {
+    const payload = JSON.stringify(body);
+    const u = new URL(url);
+    const options = {
+      hostname: u.hostname,
+      path: u.pathname + u.search,
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(payload),
+      },
+    };
+    const req = https.request(options, (res) => {
+      let data = '';
+      res.on('data', c => data += c);
+      res.on('end', () => { try { resolve(JSON.parse(data)); } catch { resolve(null); } });
+    });
+    req.on('error', () => resolve(null));
+    req.setTimeout(20000, () => { req.destroy(); resolve(null); });
+    req.write(payload);
+    req.end();
+  });
+}
+
+// ── SOLANA RPC: getTransaction ────────────────────────────────
+// Called when a log notification arrives — fetches full tx to extract mint
+async function getTransaction(signature) {
+  const result = await httpsPost(HTTP_RPC, {
+    jsonrpc: '2.0',
+    id: 1,
+    method: 'getTransaction',
+    params: [
+      signature,
+      { encoding: 'json', maxSupportedTransactionVersion: 0, commitment: 'confirmed' }
+    ]
+  });
+  return result?.result ?? null;
+}
+
+// ── MINT EXTRACTION ───────────────────────────────────────────
+function extractMint(tx) {
+  const meta     = tx?.meta;
+  const msg      = tx?.transaction?.message;
+  if (!meta || !msg) return null;
+
+  const postBals = meta.postTokenBalances ?? [];
+  const preBals  = meta.preTokenBalances  ?? [];
+  const preOwned = new Set(preBals.map(b => b.mint));
+
+  // Prefer a mint that appeared in post but NOT in pre (newly received)
+  let mint = postBals.find(b => b.mint && b.mint !== SOL_MINT && !preOwned.has(b.mint))?.mint;
+  if (!mint) mint = postBals.find(b => b.mint && b.mint !== SOL_MINT)?.mint;
+  return mint ?? null;
+}
+
 // ── GMGN ──────────────────────────────────────────────────────
 async function gmgnGet(path, params = {}) {
   params.timestamp = Math.floor(Date.now() / 1000).toString();
   params.client_id = Math.random().toString(36).substring(2) + Date.now().toString(36);
-  const query = new URLSearchParams(params).toString();
-  const fullPath = `${path}?${query}`;
+  const query   = new URLSearchParams(params).toString();
   const headers = {
     'X-APIKEY':   GMGN_API_KEY,
     'Accept':     'application/json',
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
   };
-
-  const parsed = await httpsGet('openapi.gmgn.ai', fullPath, headers);
+  const parsed = await httpsGet('openapi.gmgn.ai', `${path}?${query}`, headers);
   if (parsed?.code === 0 && parsed?.data) return parsed.data;
   log(`[GMGN] Error ${path}: ${JSON.stringify(parsed)?.substring(0, 100)}`);
   return null;
@@ -164,21 +238,11 @@ async function fetchTokenInfo(mint) {
 
 async function fetchFreshWallets(mint) {
   const data = await gmgnGet('/v1/token/security', { chain: 'sol', address: mint });
-  if (!data) {
-    log(`[GMGN] Security endpoint returned null for ${mint.substring(0, 8)}`);
-    return null;
-  }
-  // Log all keys so we can see exactly what GMGN returns
-  log(`[GMGN] Security keys for ${mint.substring(0, 8)}: ${Object.keys(data).join(', ')}`);
-  // Try every known field name variant
-  return data.fresh_holder_count
-      ?? data.fresh_wallet_count
-      ?? data.fresh_holders
-      ?? data.freshHolder
-      ?? null;
+  if (!data) return null;
+  log(`[GMGN] Security keys: ${Object.keys(data).join(', ')}`);
+  return data.fresh_holder_count ?? data.fresh_wallet_count ?? data.fresh_holders ?? data.freshHolder ?? null;
 }
 
-// ── DEXSCREENER (with retries, matching Python version) ───────
 async function fetchSameNameCount(symbol) {
   for (let attempt = 0; attempt < 3; attempt++) {
     const parsed = await httpsGet(
@@ -187,21 +251,17 @@ async function fetchSameNameCount(symbol) {
       { 'User-Agent': 'Mozilla/5.0', 'Accept': 'application/json' }
     );
     if (parsed) {
-      const pairs  = parsed?.pairs ?? [];
       const nowMs  = Date.now();
       const cutoff = 5 * 3600 * 1000;
-      const count  = pairs.filter(p =>
+      return (parsed.pairs ?? []).filter(p =>
         p.chainId === 'solana' && p.pairCreatedAt && nowMs - p.pairCreatedAt <= cutoff
       ).length;
-      return count;
     }
-    log(`[Dex] attempt ${attempt + 1} failed for ${symbol}, retrying...`);
     await new Promise(r => setTimeout(r, 5000));
   }
   return null;
 }
 
-// ── TOKEN AGE ─────────────────────────────────────────────────
 async function getTokenAge(mint) {
   const now = Math.floor(Date.now() / 1000);
   if (skipCache[mint]) return -1;
@@ -219,13 +279,12 @@ async function getTokenAge(mint) {
 // ── TELEGRAM ──────────────────────────────────────────────────
 function sendTelegram(message) {
   const body = JSON.stringify({ chat_id: CHAT_ID, text: message, parse_mode: 'HTML' });
-  const options = {
+  const req  = https.request({
     hostname: 'api.telegram.org',
     path:     `/bot${TELEGRAM_TOKEN}/sendMessage`,
     method:   'POST',
     headers:  { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) }
-  };
-  const req = https.request(options, (res) => {
+  }, (res) => {
     let d = '';
     res.on('data', c => d += c);
     res.on('end', () => {
@@ -233,10 +292,10 @@ function sendTelegram(message) {
         const p = JSON.parse(d);
         if (!p.ok) log(`[TG Error] ${p.description}`);
         else log(`[TG] Signal delivered`);
-      } catch(e) { log(`[TG Error] Parse failed`); }
+      } catch { log(`[TG Error] Parse failed`); }
     });
   });
-  req.on('error', (e) => log(`[TG ERR] ${e.message}`));
+  req.on('error', e => log(`[TG ERR] ${e.message}`));
   req.write(body);
   req.end();
 }
@@ -245,29 +304,21 @@ function sendTelegram(message) {
 async function buildAndSendSignal(tokenMint, walletCount, elapsed, tokenInfo) {
   try {
     const now = Math.floor(Date.now() / 1000);
-
-    let symbol       = 'UNKNOWN';
-    let mintTimeStr  = 'N/A';
-    let ageStr       = 'N/A';
-    let liquidityStr = 'N/A';
-    let marketCapStr = 'N/A';
+    let symbol = 'UNKNOWN', mintTimeStr = 'N/A', ageStr = 'N/A';
+    let liquidityStr = 'N/A', marketCapStr = 'N/A';
 
     if (tokenInfo) {
       symbol = tokenInfo.symbol ?? 'UNKNOWN';
-
       const createdAt = tokenInfo.creation_timestamp;
       if (createdAt) {
         mintTimeStr = new Date(createdAt * 1000).toLocaleTimeString('en-US', {
-          timeZone: 'America/Toronto',
-          hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true
+          timeZone: 'America/Toronto', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true
         });
-        const ageSecs = now - createdAt;
-        ageStr = ageSecs < 60 ? `${ageSecs}s` : `${Math.floor(ageSecs / 60)}m ${ageSecs % 60}s`;
+        const s = now - createdAt;
+        ageStr = s < 60 ? `${s}s` : `${Math.floor(s/60)}m ${s%60}s`;
       }
-
       const liq = parseFloat(tokenInfo.liquidity);
       if (!isNaN(liq)) liquidityStr = `$${liq.toLocaleString('en-US', { maximumFractionDigits: 0 })}`;
-
       const mc = parseFloat(tokenInfo.market_cap ?? tokenInfo.usd_market_cap);
       if (!isNaN(mc)) marketCapStr = `$${mc.toLocaleString('en-US', { maximumFractionDigits: 0 })}`;
     }
@@ -278,11 +329,10 @@ async function buildAndSendSignal(tokenMint, walletCount, elapsed, tokenInfo) {
     ]);
 
     const signalTime = new Date().toLocaleTimeString('en-US', {
-      timeZone: 'America/Toronto',
-      hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true
+      timeZone: 'America/Toronto', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true
     });
 
-    const msg =
+    sendTelegram(
       `🚨 <b>3-Wallet Signal</b>\n\n` +
       `Token: #${symbol}\n` +
       `Contract: <code>${tokenMint}</code>\n` +
@@ -294,115 +344,204 @@ async function buildAndSendSignal(tokenMint, walletCount, elapsed, tokenInfo) {
       `Fresh Wallets: ${freshWallets !== null ? freshWallets : 'N/A'}\n` +
       `Wallets Coordinated: ${walletCount} within ${elapsed}s\n\n` +
       `Signal Time: ${signalTime}\n\n` +
-      `<a href="https://gmgn.ai/sol/token/${tokenMint}">GMGN</a>`;
-
-    sendTelegram(msg);
+      `<a href="https://gmgn.ai/sol/token/${tokenMint}">GMGN</a>`
+    );
     log(`[ALERT] Signal sent for #${symbol} (${tokenMint.substring(0, 8)})`);
-  } catch(e) {
-    log(`[ERR] buildAndSendSignal: ${e.message}`);
-  }
+  } catch(e) { log(`[ERR] buildAndSendSignal: ${e.message}`); }
 }
 
-// ── TX HANDLER ────────────────────────────────────────────────
-async function handleTx(tx) {
-  try {
-    const data        = tx?.raw ?? tx;
-    const meta        = data?.meta;
-    const transaction = data?.transaction || {};
-    const message     = transaction?.message || {};
-
-    const accountKeys = [
-      ...(message.accountKeys?.map(k => k?.pubkey ?? k) ?? []),
-      ...(data?.accountKeys ?? []),
-      ...(meta?.loadedAddresses?.writable ?? []),
-      ...(meta?.loadedAddresses?.readonly ?? [])
-    ].filter(Boolean);
-
-    const trackedWallet = accountKeys.find(a => WALLETS.has(a));
-    if (!trackedWallet) return;
-
-    log(`[WALLET HIT] ${trackedWallet.substring(0, 8)}...`);
-
-    const postBals = meta?.postTokenBalances ?? [];
-    const preOwned = new Set((meta?.preTokenBalances ?? []).map(b => b.mint));
-
-    let tokenMint = postBals.find(b =>
-      b.mint && b.mint !== SOL_MINT && !preOwned.has(b.mint)
-    )?.mint;
-    if (!tokenMint) tokenMint = postBals.find(b => b.mint && b.mint !== SOL_MINT)?.mint;
-
-    if (!tokenMint) {
-      log(`[SKIP] No token mint for ${trackedWallet.substring(0, 8)}`);
-      return;
-    }
-
-    if (firedAlerts.has(tokenMint)) {
-      log(`[SKIP] ${tokenMint.substring(0, 8)} already signalled`);
-      return;
-    }
-
-    const age = await getTokenAge(tokenMint);
-    if (age === -1) { log(`[SKIP] ${tokenMint.substring(0, 8)} older than 1hr`); return; }
-    if (age === null) log(`[WARN] Age unknown for ${tokenMint.substring(0, 8)} — allowing through`);
-    else log(`[AGE] ${tokenMint.substring(0, 8)} is ${age < 60 ? age + 's' : Math.floor(age/60) + 'm ' + age%60 + 's'} old`);
-
-    const now = Math.floor(Date.now() / 1000);
-
-    if (!activeAlerts[tokenMint]) {
-      activeAlerts[tokenMint] = { wallets: new Set(), firstSeenAt: now };
-    }
-
-    const entry = activeAlerts[tokenMint];
-
-    if (now - entry.firstSeenAt > WINDOW_SECS) {
-      log(`[RESET] ${tokenMint.substring(0, 8)} window expired — resetting`);
-      activeAlerts[tokenMint] = { wallets: new Set(), firstSeenAt: now };
-    }
-
-    entry.wallets.add(trackedWallet);
-    const count = entry.wallets.size;
-    log(`[COUNT] ${count}/3 wallets bought ${tokenMint.substring(0, 8)} within ${now - entry.firstSeenAt}s`);
-
-    if (count >= 3) {
-      const elapsed = now - entry.firstSeenAt;
-      saveFiredAlert(tokenMint);      // persist to disk immediately
-      delete activeAlerts[tokenMint];
-      const tokenInfo = await fetchTokenInfo(tokenMint);
-      await buildAndSendSignal(tokenMint, count, elapsed, tokenInfo);
-    }
-  } catch(e) {
-    log(`[ERR] handleTx: ${e.message}`);
-  }
-}
-
-// ── ROUTES ────────────────────────────────────────────────────
-app.get('/', (req, res) => res.send('Tracker Active.'));
-
-app.post('/webhook', (req, res) => {
-  res.sendStatus(200);
-
-  if (!isActiveHours()) {
-    log(`[SKIP] Outside active hours (11am-6pm ET)`);
+// ── COORDINATION LOGIC ────────────────────────────────────────
+async function handleWalletBuy(trackedWallet, tokenMint) {
+  if (firedAlerts.has(tokenMint)) {
+    log(`[SKIP] ${tokenMint.substring(0, 8)} already signalled`);
     return;
   }
 
-  const body = req.body;
-  let txs = [];
-  try {
-    const blocks = Array.isArray(body) ? body : [body];
-    for (const item of blocks) {
-      const transactions = item?.transactions;
-      if (Array.isArray(transactions)) txs.push(...transactions);
-    }
-  } catch(e) {
-    log(`[ERR] Payload parsing: ${e.message}`);
+  const age = await getTokenAge(tokenMint);
+  if (age === -1) { log(`[SKIP] ${tokenMint.substring(0, 8)} > 1hr old`); return; }
+  if (age === null) log(`[WARN] Age unknown for ${tokenMint.substring(0, 8)} — allowing`);
+  else log(`[AGE] ${tokenMint.substring(0, 8)} is ${age < 60 ? age+'s' : Math.floor(age/60)+'m '+age%60+'s'} old`);
+
+  const now = Math.floor(Date.now() / 1000);
+
+  if (!activeAlerts[tokenMint]) {
+    activeAlerts[tokenMint] = { wallets: new Set(), firstSeenAt: now };
   }
 
-  if (txs.length > 0) {
-    log(`[PAYLOAD] ${txs.length} transaction(s)`);
-    (async () => { for (const tx of txs) await handleTx(tx); })();
+  const entry = activeAlerts[tokenMint];
+
+  if (now - entry.firstSeenAt > WINDOW_SECS) {
+    log(`[RESET] ${tokenMint.substring(0, 8)} window expired — resetting`);
+    activeAlerts[tokenMint] = { wallets: new Set(), firstSeenAt: now };
   }
+
+  entry.wallets.add(trackedWallet);
+  const count = entry.wallets.size;
+  log(`[COUNT] ${count}/3 for ${tokenMint.substring(0, 8)} within ${now - entry.firstSeenAt}s`);
+
+  if (count >= 3) {
+    const elapsed = now - entry.firstSeenAt;
+    saveFiredAlert(tokenMint);
+    delete activeAlerts[tokenMint];
+    const tokenInfo = await fetchTokenInfo(tokenMint);
+    await buildAndSendSignal(tokenMint, count, elapsed, tokenInfo);
+  }
+}
+
+// ── PROCESS LOG NOTIFICATION ──────────────────────────────────
+async function processLogNotification(params) {
+  if (!isActiveHours()) return;
+
+  const result = params?.result;
+  if (!result || result.err !== null) return; // skip failed txs
+
+  const signature   = result.signature;
+  const logs        = result.logs ?? [];
+
+  // Find which tracked wallet this log mentions
+  // logsSubscribe fires once per subscription match, so we know which wallet triggered it
+  // but the notification doesn't tell us which sub ID fired — we figure it from context
+  // Instead we use the subscription ID from the outer message
+  const subId       = params?.subscription;
+  const trackedWallet = subIdToWallet[subId];
+
+  if (!trackedWallet) return;
+  log(`[LOG HIT] wallet ${trackedWallet.substring(0, 8)} | sig ${signature.substring(0, 12)}...`);
+
+  // Debounce: same sig can fire for multiple wallet subs if two tracked wallets are in same tx
+  if (pendingSigs.has(signature)) {
+    log(`[DEBOUNCE] ${signature.substring(0, 12)} already being processed`);
+    return;
+  }
+  pendingSigs.add(signature);
+  setTimeout(() => pendingSigs.delete(signature), 30000);
+
+  // Fetch full transaction to extract the token mint
+  let tx = null;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    tx = await getTransaction(signature);
+    if (tx) break;
+    log(`[RPC] getTransaction attempt ${attempt + 1} failed, retrying...`);
+    await new Promise(r => setTimeout(r, 2000));
+  }
+
+  if (!tx) {
+    log(`[SKIP] Could not fetch tx ${signature.substring(0, 12)}`);
+    return;
+  }
+
+  const mint = extractMint(tx);
+  if (!mint) {
+    log(`[SKIP] No token mint in tx for ${trackedWallet.substring(0, 8)}`);
+    return;
+  }
+
+  log(`[MINT] ${trackedWallet.substring(0, 8)} bought ${mint.substring(0, 8)}`);
+  await handleWalletBuy(trackedWallet, mint);
+}
+
+// ── WEBSOCKET ─────────────────────────────────────────────────
+function connect(useUrl) {
+  const url = useUrl ?? (usingFallback ? WSS_FALLBACK : WSS_PRIMARY);
+  log(`[WS] Connecting to ${usingFallback ? 'FALLBACK' : 'PRIMARY'} endpoint...`);
+
+  ws = new WebSocket(url, { handshakeTimeout: 30000 });
+  subIdToWallet = {};
+  wsReady = false;
+
+  ws.on('open', () => {
+    log(`[WS] Connected — subscribing to ${WALLETS.length} wallets...`);
+    wsReady = true;
+    reconnectDelay = 5000; // reset backoff on successful connect
+
+    // Subscribe to each wallet with a unique request ID
+    // We map req ID → wallet, then map sub ID → wallet once confirmed
+    WALLETS.forEach((wallet, i) => {
+      ws.send(JSON.stringify({
+        jsonrpc: '2.0',
+        id: i + 1,  // 1-indexed, unique per wallet
+        method: 'logsSubscribe',
+        params: [
+          { mentions: [wallet] },
+          { commitment: 'confirmed' }
+        ]
+      }));
+    });
+
+    log(`[WS] All ${WALLETS.length} subscription requests sent`);
+
+    // Ping every 30s to keep connection alive
+    const pingInterval = setInterval(() => {
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.ping();
+      } else {
+        clearInterval(pingInterval);
+      }
+    }, 30000);
+  });
+
+  ws.on('message', (data) => {
+    let msg;
+    try { msg = JSON.parse(data.toString()); }
+    catch { return; }
+
+    // Subscription confirmation: maps our request ID to the assigned subscription ID
+    if (msg.id && msg.result !== undefined && typeof msg.result === 'number') {
+      const wallet = WALLETS[msg.id - 1]; // our IDs are 1-indexed wallet array positions
+      if (wallet) {
+        subIdToWallet[msg.result] = wallet;
+        // Only log every 10th to avoid spam
+        if (msg.id % 10 === 0) log(`[WS] ${msg.id}/${WALLETS.length} subscriptions confirmed`);
+        if (msg.id === WALLETS.length) log(`[WS] ✅ All ${WALLETS.length} subscriptions active`);
+      }
+      return;
+    }
+
+    // Log notification
+    if (msg.method === 'logsNotification') {
+      processLogNotification(msg.params).catch(e => log(`[ERR] processLogNotification: ${e.message}`));
+    }
+  });
+
+  ws.on('error', (e) => {
+    log(`[WS] Error: ${e.message}`);
+  });
+
+  ws.on('close', (code, reason) => {
+    wsReady = false;
+    log(`[WS] Disconnected (code: ${code}). Reconnecting in ${reconnectDelay / 1000}s...`);
+
+    // Try fallback endpoint if primary keeps failing
+    if (reconnectDelay >= 30000 && !usingFallback && WSS_PRIMARY !== WSS_FALLBACK) {
+      log(`[WS] Switching to fallback endpoint`);
+      usingFallback = true;
+      reconnectDelay = 5000;
+    }
+
+    setTimeout(() => connect(), reconnectDelay);
+    reconnectDelay = Math.min(reconnectDelay * 2, 60000); // exponential backoff, max 60s
+  });
+}
+
+// ── HEALTH CHECK SERVER ───────────────────────────────────────
+// Keeps Render from spinning down the service (free tier spins down on no HTTP traffic)
+const server = http.createServer((req, res) => {
+  const subCount = Object.keys(subIdToWallet).length;
+  res.writeHead(200, { 'Content-Type': 'text/plain' });
+  res.end(
+    `SOLANA WALLET TRACKER — LIVE\n` +
+    `WS: ${wsReady ? 'connected' : 'reconnecting'}\n` +
+    `Subscriptions: ${subCount}/${WALLETS.length}\n` +
+    `Fired alerts: ${firedAlerts.size}\n` +
+    `Active windows: ${Object.keys(activeAlerts).length}\n`
+  );
 });
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => log(`SOLANA WALLET TRACKER — LIVE | Watching ${WALLETS.size} wallets | Active 11am-6pm ET`));
+server.listen(process.env.PORT || 3000, () => {
+  log(`[HTTP] Health server on port ${process.env.PORT || 3000}`);
+});
+
+// ── START ─────────────────────────────────────────────────────
+log(`[START] Launching WebSocket tracker | ${WALLETS.length} wallets | Active 11am-6pm ET`);
+log(`[START] WSS primary: ${WSS_PRIMARY.replace(/api_key=[^&]+/, 'api_key=***')}`);
+connect();
