@@ -390,7 +390,7 @@ async function handleWalletBuy(trackedWallet, tokenMint) {
 
 // ── PROCESS LOG NOTIFICATION ──────────────────────────────────
 async function processLogNotification(params) {
-  if (!isActiveHours()) return;
+  // if (!isActiveHours()) return; // TIME GATE DISABLED FOR TESTING
 
   const result = params?.result;
   if (!result || result.err !== null) return; // skip failed txs
