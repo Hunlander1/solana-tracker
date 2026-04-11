@@ -441,25 +441,29 @@ async function processLogNotification(params) {
 }
 
 // ── WEBSOCKET ─────────────────────────────────────────────────
+let reqIdToWallet = {};  // request id => wallet (set when we send subscribe)
+
 function connect(useUrl) {
   const url = useUrl ?? (usingFallback ? WSS_FALLBACK : WSS_PRIMARY);
   log(`[WS] Connecting to ${usingFallback ? 'FALLBACK' : 'PRIMARY'} endpoint...`);
 
   ws = new WebSocket(url, { handshakeTimeout: 30000 });
   subIdToWallet = {};
+  reqIdToWallet = {};
   wsReady = false;
 
   ws.on('open', () => {
     log(`[WS] Connected — subscribing to ${WALLETS.length} wallets...`);
     wsReady = true;
-    reconnectDelay = 5000; // reset backoff on successful connect
+    reconnectDelay = 5000;
 
-    // Subscribe to each wallet with a unique request ID
-    // We map req ID → wallet, then map sub ID → wallet once confirmed
+    // Build reqId→wallet map BEFORE sending, so order doesn't matter
     WALLETS.forEach((wallet, i) => {
+      const reqId = i + 1;
+      reqIdToWallet[reqId] = wallet;
       ws.send(JSON.stringify({
         jsonrpc: '2.0',
-        id: i + 1,  // 1-indexed, unique per wallet
+        id: reqId,
         method: 'logsSubscribe',
         params: [
           { mentions: [wallet] },
@@ -485,20 +489,24 @@ function connect(useUrl) {
     try { msg = JSON.parse(data.toString()); }
     catch { return; }
 
-    // Subscription confirmation: maps our request ID to the assigned subscription ID
-    if (msg.id && msg.result !== undefined && typeof msg.result === 'number') {
-      const wallet = WALLETS[msg.id - 1]; // our IDs are 1-indexed wallet array positions
+    // Subscription confirmation: Solana returns { id: <our req id>, result: <sub id> }
+    // Use reqIdToWallet (reliable) not array index (order-dependent)
+    if (msg.id !== undefined && msg.result !== undefined && typeof msg.result === 'number' && !msg.method) {
+      const wallet = reqIdToWallet[msg.id];
       if (wallet) {
         subIdToWallet[msg.result] = wallet;
-        // Only log every 10th to avoid spam
-        if (msg.id % 10 === 0) log(`[WS] ${msg.id}/${WALLETS.length} subscriptions confirmed`);
-        if (msg.id === WALLETS.length) log(`[WS] ✅ All ${WALLETS.length} subscriptions active`);
+        const confirmed = Object.keys(subIdToWallet).length;
+        if (confirmed % 10 === 0) log(`[WS] ${confirmed}/${WALLETS.length} subscriptions confirmed`);
+        if (confirmed === WALLETS.length) log(`[WS] ✅ All ${WALLETS.length} subscriptions active`);
       }
       return;
     }
 
-    // Log notification
+    // Log notification — log every single one so we know they're arriving
     if (msg.method === 'logsNotification') {
+      const subId = msg.params?.subscription;
+      const wallet = subIdToWallet[subId];
+      log(`[WS] logsNotification subId=${subId} mapped=${wallet ? wallet.substring(0,8) : 'UNKNOWN'}`);
       processLogNotification(msg.params).catch(e => log(`[ERR] processLogNotification: ${e.message}`));
     }
   });
