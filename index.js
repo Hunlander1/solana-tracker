@@ -392,17 +392,20 @@ async function handleWalletBuy(trackedWallet, tokenMint) {
 async function processLogNotification(params) {
   // if (!isActiveHours()) return; // TIME GATE DISABLED FOR TESTING
 
-  const result = params?.result;
-  if (!result || result.err !== null) return; // skip failed txs
+  // Solana logsNotification structure:
+  // params = { subscription: <subId>, result: { context: { slot }, value: { signature, err, logs } } }
+  const value = params?.result?.value;
+  const subId = params?.subscription;
 
-  const signature   = result.signature;
-  const logs        = result.logs ?? [];
+  if (!value) {
+    log(`[DEBUG] No value in notification — raw: ${JSON.stringify(params)?.substring(0, 120)}`);
+    return;
+  }
 
-  // Find which tracked wallet this log mentions
-  // logsSubscribe fires once per subscription match, so we know which wallet triggered it
-  // but the notification doesn't tell us which sub ID fired — we figure it from context
-  // Instead we use the subscription ID from the outer message
-  const subId       = params?.subscription;
+  // Skip failed transactions
+  if (value.err !== null && value.err !== undefined) return;
+
+  const signature = value.signature;
   const trackedWallet = subIdToWallet[subId];
 
   if (!trackedWallet) return;
