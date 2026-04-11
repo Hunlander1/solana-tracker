@@ -390,7 +390,7 @@ async function handleWalletBuy(trackedWallet, tokenMint) {
 
 // ── PROCESS LOG NOTIFICATION ──────────────────────────────────
 async function processLogNotification(params) {
-  // if (!isActiveHours()) return; // TIME GATE DISABLED FOR TESTING
+  if (!isActiveHours()) return; // 11am-6pm ET only
 
   // Solana logsNotification structure:
   // params = { subscription: <subId>, result: { context: { slot }, value: { signature, err, logs } } }
@@ -556,3 +556,21 @@ server.listen(process.env.PORT || 3000, () => {
 log(`[START] Launching WebSocket tracker | ${WALLETS.length} wallets | Active 11am-6pm ET`);
 log(`[START] WSS primary: ${WSS_PRIMARY.replace(/api_key=[^&]+/, 'api_key=***')}`);
 connect();
+
+// ── SELF-PING (keeps Render free tier from sleeping) ──────────
+// Render spins down free services after ~15min of no HTTP traffic.
+// We ping our own health endpoint every 10 minutes to stay awake.
+const RENDER_URL = process.env.RENDER_EXTERNAL_URL || null;
+setInterval(() => {
+  if (!RENDER_URL) return;
+  try {
+    const mod = RENDER_URL.startsWith('https') ? https : http;
+    const req = mod.get(RENDER_URL + '/', (res) => {
+      log(`[PING] Self-ping OK (${res.statusCode})`);
+    });
+    req.on('error', (e) => log(`[PING] Self-ping failed: ${e.message}`));
+    req.setTimeout(10000, () => req.destroy());
+  } catch(e) {
+    log(`[PING] Self-ping error: ${e.message}`);
+  }
+}, 10 * 60 * 1000); // every 10 minutes
