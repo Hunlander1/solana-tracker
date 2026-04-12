@@ -81,7 +81,7 @@ const WALLETS = [
   "FTaSBuVj6w2S7XUa8fw19xrLy57DDr6kZDL6sxDXtvTP", "FSAmbD6jm6SZZQadSJeC1paX3oTtAiY9hTx1UYzVoXqj",
   "G6fUXjMKPJzCY1rveAE6Qm7wy5U3vZgKDJmN1VPAdiZC", "Ar2Y6o1QmrRAskjii1cRfijeKugHH13ycxW5cd7rro1x",
   "5aLY85pyxiuX3fd4RgM3Yc1e3MAL6b7UgaZz6MS3JUfG", "DYAn4XpAkN5mhiXkRB7dGq4Jadnx6XYgu8L5b3WGhbrt",
-  "7BNaxx6KdUYrjACNQZ9He26NBFoFxujQMAfNLnArLGH5", "2NuAgVk3hcb7s4YvP4GjV5fD8eDvZQv5wuN6ZC8igRfV",
+  "7BNaxx6KdUYrjACNQZ9He26NBFoFxujQMAfNLnArLGH5",
   "BCnqsPEtA1TkgednYEebRpkmwFRJDCjMQcKZMMtEdArc", "4BdKaxN8G6ka4GYtQQWk4G4dZRUTX2vQH9GcXdBREFUk",
   "5ZuV8eqkvzYFVEKbLvGBdexL2tFv7E5BCd2HZpjqbdg", "FM1YCKED2KaqB8Uat8aB1nsffR1vezr7s6FAEieXJgke",
   "AV7PjXHL5JXZ1YoYRoN9Dsstg1x2UciBupMCXcJP8gUz", "Dzp1SrZ474xwGp6ZEP6cNKo39u9zeXe1YAuTkyZyv3t4",
@@ -103,7 +103,16 @@ const WALLETS = [
   "D9gQ6RhKEpnobPBUdWY5bPQt2p3zGk3iVz6ChpUi2ArA", "BZC7VEj5Y9Ege3cTRGBZW2zW7pjw3hpiSkcAoYKysvue",
   "FgifQEkRkSSXZjf2cJ4c55BhVts2yrNKzmzBLLyicg8b", "EFaQQTGywnD4CjQQvTugUiyVT4LV9G6MsWqiub8X6unN",
   "HUgpmqL6r4Z4iEZiVuNZ6J6QnAsSZpsL8giVyVtz3QhT", "FaBGrHWjcJ8vKnbgUtsdpZjvF7YAAajtQTWmmEHiKtQr",
-  "HYWo71Wk9PNDe5sBaRKazPnVyGnQDiwgXCFKvgAQ1ENp", "bwamJzztZsepfkteWRChggmXuiiCQvpLqPietdNfSXa"
+  "HYWo71Wk9PNDe5sBaRKazPnVyGnQDiwgXCFKvgAQ1ENp", "bwamJzztZsepfkteWRChggmXuiiCQvpLqPietdNfSXa",
+  // Added wallets
+  "7moqFjvm2MwAiMtCZoqYoTAPzRBxxMRT2ddyHThQuWjr", // Smart 15
+  "DjM7Tu7whh6P3pGVBfDzwXAx2zaw51GJWrJE3PwtuN7s", // CHILLHOUSE Dev
+  "AvcWA3ngM55sSpjh1FZthmqA7V6BHo4f555a8w3Wv3ij", // Honeypot Dev
+  "J7nJ35d8EGU3fHCVCUun56C1MKakdoEQ38CFLHAhWDwP", // Together Dev
+  "6ujZxnphRxTqveaQtLAQHFoWz16xhLWZbTijcgZN4fRp", // BadBunny Dev
+  "nazikTJezTC3W2fxXE3wzs495PYzXMiq5o7co6YYACA",  // YZY Dev
+  "BtMBMPkoNbnLF9Xn552guQq528KKXcsNBNNBre3oaQtr", // Letterbomb(horse)
+  "EYfdt8cNFyyTEJKp18dcoVbgUHDnM1SK3bT2uKj9XXHc", // Penguin Dev
 ];
 const WALLET_SET = new Set(WALLETS);
 
@@ -251,23 +260,54 @@ async function fetchFreshWallets(mint) {
   return data.fresh_holder_count ?? data.fresh_wallet_count ?? data.fresh_holders ?? data.freshHolder ?? null;
 }
 
-async function fetchSameNameCount(symbol) {
-  // Try both DexScreener endpoints — they changed their API structure
-  const endpoints = [
-    `/latest/dex/search?q=${encodeURIComponent(symbol)}`,
-    `/latest/dex/tokens/${encodeURIComponent(symbol)}`,
-  ];
-  for (let attempt = 0; attempt < 3; attempt++) {
-    const path = endpoints[attempt % endpoints.length];
-    const parsed = await httpsGet(
-      'api.dexscreener.com',
+function dexscreenerGet(path) {
+  // Follows redirects manually since Node https doesn't auto-follow
+  return new Promise((resolve) => {
+    const options = {
+      hostname: 'api.dexscreener.com',
       path,
-      {
+      method: 'GET',
+      headers: {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
         'Accept': 'application/json',
         'Accept-Language': 'en-US,en;q=0.9',
-      }
-    );
+        'Cache-Control': 'no-cache',
+      },
+    };
+    const doRequest = (opts, redirects) => {
+      if (redirects > 3) { resolve(null); return; }
+      const req = https.request(opts, (res) => {
+        // Follow redirects
+        if ([301, 302, 307, 308].includes(res.statusCode) && res.headers.location) {
+          try {
+            const loc = new URL(res.headers.location);
+            doRequest({ ...opts, hostname: loc.hostname, path: loc.pathname + loc.search }, redirects + 1);
+          } catch { resolve(null); }
+          return;
+        }
+        if (res.statusCode !== 200) {
+          log(`[Dex] HTTP ${res.statusCode} for ${opts.path.substring(0, 60)}`);
+          resolve(null);
+          return;
+        }
+        let data = '';
+        res.on('data', c => data += c);
+        res.on('end', () => {
+          try { resolve(JSON.parse(data)); }
+          catch { log(`[Dex] JSON parse failed, body starts: ${data.substring(0, 80)}`); resolve(null); }
+        });
+      });
+      req.on('error', (e) => { log(`[Dex] Request error: ${e.message}`); resolve(null); });
+      req.setTimeout(15000, () => { req.destroy(); log(`[Dex] Timeout`); resolve(null); });
+      req.end();
+    };
+    doRequest(options, 0);
+  });
+}
+
+async function fetchSameNameCount(symbol) {
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const parsed = await dexscreenerGet(`/latest/dex/search?q=${encodeURIComponent(symbol)}`);
     if (parsed) {
       const pairs  = parsed.pairs ?? parsed.data ?? [];
       const nowMs  = Date.now();
@@ -277,7 +317,7 @@ async function fetchSameNameCount(symbol) {
         (p.pairCreatedAt || p.pair_created_at) &&
         nowMs - (p.pairCreatedAt ?? p.pair_created_at) <= cutoff
       ).length;
-      log(`[Dex] ${symbol}: found ${pairs.length} pairs, ${count} on Solana in 5h`);
+      log(`[Dex] ${symbol}: ${pairs.length} total pairs, ${count} Solana pairs in 5h`);
       return count;
     }
     log(`[Dex] attempt ${attempt + 1} failed for ${symbol}`);
