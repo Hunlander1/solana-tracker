@@ -152,10 +152,18 @@ function httpsGet(hostname, path, headers = {}) {
     const req = https.request(options, (res) => {
       let data = '';
       res.on('data', c => data += c);
-      res.on('end', () => { try { resolve(JSON.parse(data)); } catch { resolve(null); } });
+      res.on('end', () => {
+        if (res.statusCode !== 200) {
+          log(`[HTTP] ${hostname} returned ${res.statusCode} for ${path.substring(0, 60)}`);
+          resolve(null);
+          return;
+        }
+        try { resolve(JSON.parse(data)); }
+        catch { log(`[HTTP] JSON parse failed for ${hostname}${path.substring(0, 40)}`); resolve(null); }
+      });
     });
-    req.on('error', () => resolve(null));
-    req.setTimeout(15000, () => { req.destroy(); resolve(null); });
+    req.on('error', (e) => { log(`[HTTP] Error ${hostname}: ${e.message}`); resolve(null); });
+    req.setTimeout(15000, () => { req.destroy(); log(`[HTTP] Timeout ${hostname}`); resolve(null); });
     req.end();
   });
 }
@@ -373,9 +381,9 @@ async function buildAndSendSignal(tokenMint, walletCount, elapsed, tokenInfo) {
       timeZone: 'America/Toronto', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true
     });
 
-    // Shorten dev wallet for display (first 4 ... last 4)
-    const devWalletShort = devWallet !== 'N/A'
-      ? `<code>${devWallet.substring(0, 4)}...${devWallet.substring(devWallet.length - 4)}</code>`
+    // Full dev wallet as copyable code, with GMGN link
+    const devWalletLine = devWallet !== 'N/A'
+      ? `<code>${devWallet}</code>`
       : 'N/A';
 
     sendTelegram(
@@ -389,7 +397,7 @@ async function buildAndSendSignal(tokenMint, walletCount, elapsed, tokenInfo) {
       `Same-Name Count (5h): ${sameNameCount !== null ? sameNameCount : '?'}\n` +
       `Fresh Wallets: ${freshWallets !== null ? freshWallets : 'N/A'}\n` +
       `Wallets Coordinated: ${walletCount} within ${elapsed}s\n\n` +
-      `Dev Wallet: ${devWalletShort}\n` +
+      `Dev Wallet: ${devWalletLine}\n` +
       `Dev ATH: ${devAth}\n\n` +
       `Signal Time: ${signalTime}\n\n` +
       `<a href="https://gmgn.ai/sol/token/${tokenMint}">GMGN</a>`
