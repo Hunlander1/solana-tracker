@@ -244,20 +244,36 @@ async function fetchFreshWallets(mint) {
 }
 
 async function fetchSameNameCount(symbol) {
+  // Try both DexScreener endpoints — they changed their API structure
+  const endpoints = [
+    `/latest/dex/search?q=${encodeURIComponent(symbol)}`,
+    `/latest/dex/tokens/${encodeURIComponent(symbol)}`,
+  ];
   for (let attempt = 0; attempt < 3; attempt++) {
+    const path = endpoints[attempt % endpoints.length];
     const parsed = await httpsGet(
       'api.dexscreener.com',
-      `/latest/dex/search?q=${encodeURIComponent(symbol)}`,
-      { 'User-Agent': 'Mozilla/5.0', 'Accept': 'application/json' }
+      path,
+      {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+        'Accept': 'application/json',
+        'Accept-Language': 'en-US,en;q=0.9',
+      }
     );
     if (parsed) {
+      const pairs  = parsed.pairs ?? parsed.data ?? [];
       const nowMs  = Date.now();
       const cutoff = 5 * 3600 * 1000;
-      return (parsed.pairs ?? []).filter(p =>
-        p.chainId === 'solana' && p.pairCreatedAt && nowMs - p.pairCreatedAt <= cutoff
+      const count  = pairs.filter(p =>
+        (p.chainId === 'solana' || p.chain_id === 'solana') &&
+        (p.pairCreatedAt || p.pair_created_at) &&
+        nowMs - (p.pairCreatedAt ?? p.pair_created_at) <= cutoff
       ).length;
+      log(`[Dex] ${symbol}: found ${pairs.length} pairs, ${count} on Solana in 5h`);
+      return count;
     }
-    await new Promise(r => setTimeout(r, 5000));
+    log(`[Dex] attempt ${attempt + 1} failed for ${symbol}`);
+    if (attempt < 2) await new Promise(r => setTimeout(r, 3000));
   }
   return null;
 }
@@ -306,6 +322,8 @@ async function buildAndSendSignal(tokenMint, walletCount, elapsed, tokenInfo) {
     const now = Math.floor(Date.now() / 1000);
     let symbol = 'UNKNOWN', mintTimeStr = 'N/A', ageStr = 'N/A';
     let liquidityStr = 'N/A', marketCapStr = 'N/A';
+    let devWallet = 'N/A', devAth = 'N/A', devAthSymbol = '';
+    let freshWalletsFromInfo = null;
 
     if (tokenInfo) {
       symbol = tokenInfo.symbol ?? 'UNKNOWN';
@@ -321,16 +339,44 @@ async function buildAndSendSignal(tokenMint, walletCount, elapsed, tokenInfo) {
       if (!isNaN(liq)) liquidityStr = `$${liq.toLocaleString('en-US', { maximumFractionDigits: 0 })}`;
       const mc = parseFloat(tokenInfo.market_cap ?? tokenInfo.usd_market_cap);
       if (!isNaN(mc)) marketCapStr = `$${mc.toLocaleString('en-US', { maximumFractionDigits: 0 })}`;
+
+      // Dev wallet address
+      const creatorAddr = tokenInfo.dev?.creator_address;
+      if (creatorAddr) devWallet = creatorAddr;
+
+      // Dev all-time-high token
+      const athInfo = tokenInfo.dev?.ath_token_info;
+      if (athInfo?.ath_mc) {
+        const athMc = parseFloat(athInfo.ath_mc);
+        if (!isNaN(athMc)) {
+          devAthSymbol = athInfo.symbol ? ` #${athInfo.symbol}` : '';
+          devAth = athMc >= 1_000_000
+            ? `$${(athMc / 1_000_000).toFixed(1)}M${devAthSymbol}`
+            : `$${athMc.toLocaleString('en-US', { maximumFractionDigits: 0 })}${devAthSymbol}`;
+        }
+      }
+
+      // Fresh wallets — prefer wallet_tags_stat (already in token info, no extra call)
+      const fwStat = tokenInfo.wallet_tags_stat?.fresh_wallets;
+      if (fwStat !== undefined && fwStat !== null) freshWalletsFromInfo = fwStat;
     }
 
-    const [sameNameCount, freshWallets] = await Promise.all([
+    // Run same-name count and security fetch in parallel
+    const [sameNameCount, freshWalletsFromSecurity] = await Promise.all([
       symbol !== 'UNKNOWN' ? fetchSameNameCount(symbol) : Promise.resolve(null),
-      fetchFreshWallets(tokenMint)
+      freshWalletsFromInfo === null ? fetchFreshWallets(tokenMint) : Promise.resolve(null)
     ]);
+
+    const freshWallets = freshWalletsFromInfo ?? freshWalletsFromSecurity;
 
     const signalTime = new Date().toLocaleTimeString('en-US', {
       timeZone: 'America/Toronto', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true
     });
+
+    // Shorten dev wallet for display (first 4 ... last 4)
+    const devWalletShort = devWallet !== 'N/A'
+      ? `<code>${devWallet.substring(0, 4)}...${devWallet.substring(devWallet.length - 4)}</code>`
+      : 'N/A';
 
     sendTelegram(
       `🚨 <b>3-Wallet Signal</b>\n\n` +
@@ -343,10 +389,12 @@ async function buildAndSendSignal(tokenMint, walletCount, elapsed, tokenInfo) {
       `Same-Name Count (5h): ${sameNameCount !== null ? sameNameCount : '?'}\n` +
       `Fresh Wallets: ${freshWallets !== null ? freshWallets : 'N/A'}\n` +
       `Wallets Coordinated: ${walletCount} within ${elapsed}s\n\n` +
+      `Dev Wallet: ${devWalletShort}\n` +
+      `Dev ATH: ${devAth}\n\n` +
       `Signal Time: ${signalTime}\n\n` +
       `<a href="https://gmgn.ai/sol/token/${tokenMint}">GMGN</a>`
     );
-    log(`[ALERT] Signal sent for #${symbol} (${tokenMint.substring(0, 8)})`);
+    log(`[ALERT] Signal sent for #${symbol} (${tokenMint.substring(0, 8)}) | Dev ATH: ${devAth}`);
   } catch(e) { log(`[ERR] buildAndSendSignal: ${e.message}`); }
 }
 
