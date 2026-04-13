@@ -260,56 +260,53 @@ async function fetchFreshWallets(mint) {
   return data.fresh_holder_count ?? data.fresh_wallet_count ?? data.fresh_holders ?? data.freshHolder ?? null;
 }
 
-function dexscreenerGet(path) {
-  // Follows redirects manually since Node https doesn't auto-follow
-  return new Promise((resolve) => {
-    const options = {
-      hostname: 'api.dexscreener.com',
-      path,
-      method: 'GET',
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-        'Accept': 'application/json',
-        'Accept-Language': 'en-US,en;q=0.9',
-        'Cache-Control': 'no-cache',
-      },
-    };
-    const doRequest = (opts, redirects) => {
-      if (redirects > 3) { resolve(null); return; }
-      const req = https.request(opts, (res) => {
-        // Follow redirects
+async function fetchSameNameCount(symbol) {
+  // Uses https.get which handles redirects automatically unlike https.request
+  log(`[Dex] Fetching same-name count for ${symbol}...`);
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const result = await new Promise((resolve) => {
+      const url = `https://api.dexscreener.com/latest/dex/search?q=${encodeURIComponent(symbol)}`;
+      const req = https.get(url, {
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+          'Accept': 'application/json',
+        }
+      }, (res) => {
+        log(`[Dex] HTTP ${res.statusCode} for ${symbol}`);
+        // https.get does NOT follow redirects — handle manually
         if ([301, 302, 307, 308].includes(res.statusCode) && res.headers.location) {
-          try {
-            const loc = new URL(res.headers.location);
-            doRequest({ ...opts, hostname: loc.hostname, path: loc.pathname + loc.search }, redirects + 1);
-          } catch { resolve(null); }
+          res.resume(); // drain
+          const redirectReq = https.get(res.headers.location, {
+            headers: {
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+              'Accept': 'application/json',
+            }
+          }, (res2) => {
+            let data = '';
+            res2.on('data', c => data += c);
+            res2.on('end', () => {
+              try { resolve(JSON.parse(data)); }
+              catch { log(`[Dex] Redirect parse fail: ${data.substring(0, 80)}`); resolve(null); }
+            });
+          });
+          redirectReq.on('error', (e) => { log(`[Dex] Redirect error: ${e.message}`); resolve(null); });
+          redirectReq.setTimeout(15000, () => { redirectReq.destroy(); resolve(null); });
           return;
         }
-        if (res.statusCode !== 200) {
-          log(`[Dex] HTTP ${res.statusCode} for ${opts.path.substring(0, 60)}`);
-          resolve(null);
-          return;
-        }
+        if (res.statusCode !== 200) { res.resume(); resolve(null); return; }
         let data = '';
         res.on('data', c => data += c);
         res.on('end', () => {
           try { resolve(JSON.parse(data)); }
-          catch { log(`[Dex] JSON parse failed, body starts: ${data.substring(0, 80)}`); resolve(null); }
+          catch { log(`[Dex] Parse fail: ${data.substring(0, 80)}`); resolve(null); }
         });
       });
-      req.on('error', (e) => { log(`[Dex] Request error: ${e.message}`); resolve(null); });
+      req.on('error', (e) => { log(`[Dex] Error: ${e.message}`); resolve(null); });
       req.setTimeout(15000, () => { req.destroy(); log(`[Dex] Timeout`); resolve(null); });
-      req.end();
-    };
-    doRequest(options, 0);
-  });
-}
+    });
 
-async function fetchSameNameCount(symbol) {
-  for (let attempt = 0; attempt < 3; attempt++) {
-    const parsed = await dexscreenerGet(`/latest/dex/search?q=${encodeURIComponent(symbol)}`);
-    if (parsed) {
-      const pairs  = parsed.pairs ?? parsed.data ?? [];
+    if (result) {
+      const pairs  = result.pairs ?? result.data ?? [];
       const nowMs  = Date.now();
       const cutoff = 5 * 3600 * 1000;
       const count  = pairs.filter(p =>
@@ -317,12 +314,13 @@ async function fetchSameNameCount(symbol) {
         (p.pairCreatedAt || p.pair_created_at) &&
         nowMs - (p.pairCreatedAt ?? p.pair_created_at) <= cutoff
       ).length;
-      log(`[Dex] ${symbol}: ${pairs.length} total pairs, ${count} Solana pairs in 5h`);
+      log(`[Dex] ${symbol}: ${pairs.length} total pairs, ${count} Solana in 5h`);
       return count;
     }
-    log(`[Dex] attempt ${attempt + 1} failed for ${symbol}`);
+    log(`[Dex] attempt ${attempt + 1} got null for ${symbol}`);
     if (attempt < 2) await new Promise(r => setTimeout(r, 3000));
   }
+  log(`[Dex] All attempts failed for ${symbol}`);
   return null;
 }
 
