@@ -28,8 +28,9 @@ const GMGN_API_KEY   = process.env.GMGN_API_KEY;
 const SHYFT_API_KEY  = process.env.SHYFT_API_KEY;  // free Shyft key for WSS
 
 const SOL_MINT     = 'So11111111111111111111111111111111111111112';
-const WINDOW_SECS  = 120;
-const MAX_TOKEN_AGE = 3600;
+const WINDOW_SECS    = 120;
+const MAX_TOKEN_AGE  = 3600;
+const STRICT_AGE_CHECK = false; // true = reject token if age can't be confirmed (use on fast bot)
 
 // WSS endpoints — primary is Shyft (free, unlimited RPC), fallback is public Solana
 // HTTP RPC for getTransaction calls
@@ -119,6 +120,7 @@ const WALLET_SET = new Set(WALLETS);
 // ── STATE ─────────────────────────────────────────────────────
 let firedAlerts   = loadFiredAlerts();
 let activeAlerts  = {};   // tokenMint => { wallets: Set, firstSeenAt }
+let devWalletCache = {};  // tokenMint => creator_address (skip dev buys)
 let creationCache = {};
 let skipCache     = {};
 let subIdToWallet = {};   // subscription id => wallet address
@@ -260,67 +262,32 @@ async function fetchFreshWallets(mint) {
   return data.fresh_holder_count ?? data.fresh_wallet_count ?? data.fresh_holders ?? data.freshHolder ?? null;
 }
 
-async function fetchSameNameCount(symbol) {
-  // Uses https.get which handles redirects automatically unlike https.request
-  log(`[Dex] Fetching same-name count for ${symbol}...`);
+async function fetchSameNameCount(mint) {
+  // Uses GMGN connection_history — same API key, no DexScreener dependency
+  // Returns count of tokens with same name/symbol launched in last 5 hours
+  log(`[SameName] Fetching connection history for ${mint.substring(0, 8)}...`);
   for (let attempt = 0; attempt < 3; attempt++) {
-    const result = await new Promise((resolve) => {
-      const url = `https://api.dexscreener.com/latest/dex/search?q=${encodeURIComponent(symbol)}`;
-      const req = https.get(url, {
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-          'Accept': 'application/json',
-        }
-      }, (res) => {
-        log(`[Dex] HTTP ${res.statusCode} for ${symbol}`);
-        // https.get does NOT follow redirects — handle manually
-        if ([301, 302, 307, 308].includes(res.statusCode) && res.headers.location) {
-          res.resume(); // drain
-          const redirectReq = https.get(res.headers.location, {
-            headers: {
-              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-              'Accept': 'application/json',
-            }
-          }, (res2) => {
-            let data = '';
-            res2.on('data', c => data += c);
-            res2.on('end', () => {
-              try { resolve(JSON.parse(data)); }
-              catch { log(`[Dex] Redirect parse fail: ${data.substring(0, 80)}`); resolve(null); }
-            });
-          });
-          redirectReq.on('error', (e) => { log(`[Dex] Redirect error: ${e.message}`); resolve(null); });
-          redirectReq.setTimeout(15000, () => { redirectReq.destroy(); resolve(null); });
-          return;
-        }
-        if (res.statusCode !== 200) { res.resume(); resolve(null); return; }
-        let data = '';
-        res.on('data', c => data += c);
-        res.on('end', () => {
-          try { resolve(JSON.parse(data)); }
-          catch { log(`[Dex] Parse fail: ${data.substring(0, 80)}`); resolve(null); }
-        });
-      });
-      req.on('error', (e) => { log(`[Dex] Error: ${e.message}`); resolve(null); });
-      req.setTimeout(15000, () => { req.destroy(); log(`[Dex] Timeout`); resolve(null); });
+    const data = await gmgnGet('/v1/token/connection_history', {
+      chain: 'sol',
+      address: mint,
+      limit: '100',
     });
-
-    if (result) {
-      const pairs  = result.pairs ?? result.data ?? [];
-      const nowMs  = Date.now();
-      const cutoff = 5 * 3600 * 1000;
-      const count  = pairs.filter(p =>
-        (p.chainId === 'solana' || p.chain_id === 'solana') &&
-        (p.pairCreatedAt || p.pair_created_at) &&
-        nowMs - (p.pairCreatedAt ?? p.pair_created_at) <= cutoff
-      ).length;
-      log(`[Dex] ${symbol}: ${pairs.length} total pairs, ${count} Solana in 5h`);
+    if (data !== null) {
+      const items = data.history ?? data.items ?? data.tokens ?? data ?? [];
+      const arr = Array.isArray(items) ? items : [];
+      const nowSecs = Math.floor(Date.now() / 1000);
+      const cutoff  = 5 * 3600; // 5 hours in seconds
+      const count = arr.filter(t => {
+        const ts = t.creation_timestamp ?? t.created_at ?? t.open_timestamp ?? 0;
+        return ts && nowSecs - ts <= cutoff;
+      }).length;
+      log(`[SameName] ${mint.substring(0, 8)}: ${arr.length} connected tokens, ${count} in last 5h`);
       return count;
     }
-    log(`[Dex] attempt ${attempt + 1} got null for ${symbol}`);
-    if (attempt < 2) await new Promise(r => setTimeout(r, 3000));
+    log(`[SameName] attempt ${attempt + 1} failed for ${mint.substring(0, 8)}`);
+    if (attempt < 2) await new Promise(r => setTimeout(r, 2000));
   }
-  log(`[Dex] All attempts failed for ${symbol}`);
+  log(`[SameName] All attempts failed for ${mint.substring(0, 8)}`);
   return null;
 }
 
@@ -383,8 +350,14 @@ async function buildAndSendSignal(tokenMint, walletCount, elapsed, tokenInfo) {
       }
       const liq = parseFloat(tokenInfo.liquidity);
       if (!isNaN(liq)) liquidityStr = `$${liq.toLocaleString('en-US', { maximumFractionDigits: 0 })}`;
-      const mc = parseFloat(tokenInfo.market_cap ?? tokenInfo.usd_market_cap);
-      if (!isNaN(mc)) marketCapStr = `$${mc.toLocaleString('en-US', { maximumFractionDigits: 0 })}`;
+      // Market cap: try direct field first, then calculate from price × supply
+      let mc = parseFloat(tokenInfo.market_cap ?? tokenInfo.usd_market_cap);
+      if (isNaN(mc) || mc === 0) {
+        const price = parseFloat(tokenInfo.price);
+        const supply = parseFloat(tokenInfo.circulating_supply ?? tokenInfo.total_supply);
+        if (!isNaN(price) && !isNaN(supply) && price > 0 && supply > 0) mc = price * supply;
+      }
+      if (!isNaN(mc) && mc > 0) marketCapStr = `$${mc.toLocaleString('en-US', { maximumFractionDigits: 0 })}`;
 
       // Dev wallet address
       const creatorAddr = tokenInfo.dev?.creator_address;
@@ -409,7 +382,7 @@ async function buildAndSendSignal(tokenMint, walletCount, elapsed, tokenInfo) {
 
     // Run same-name count and security fetch in parallel
     const [sameNameCount, freshWalletsFromSecurity] = await Promise.all([
-      symbol !== 'UNKNOWN' ? fetchSameNameCount(symbol) : Promise.resolve(null),
+      fetchSameNameCount(tokenMint),  // uses GMGN connection_history
       freshWalletsFromInfo === null ? fetchFreshWallets(tokenMint) : Promise.resolve(null)
     ]);
 
@@ -451,10 +424,26 @@ async function handleWalletBuy(trackedWallet, tokenMint) {
     return;
   }
 
+  // Fetch and cache the dev wallet address — skip buy if wallet IS the dev
+  if (!devWalletCache[tokenMint]) {
+    const devInfo = await fetchTokenInfo(tokenMint);
+    devWalletCache[tokenMint] = devInfo?.dev?.creator_address ?? 'unknown';
+    setTimeout(() => delete devWalletCache[tokenMint], 600000); // clear after 10 min
+  }
+  if (devWalletCache[tokenMint] && devWalletCache[tokenMint] !== 'unknown' &&
+      trackedWallet === devWalletCache[tokenMint]) {
+    log(`[SKIP] ${trackedWallet.substring(0, 8)} is the dev wallet — not counting`);
+    return;
+  }
+
   const age = await getTokenAge(tokenMint);
-  if (age === -1) { log(`[SKIP] ${tokenMint.substring(0, 8)} > 1hr old`); return; }
-  if (age === null) log(`[WARN] Age unknown for ${tokenMint.substring(0, 8)} — allowing`);
-  else log(`[AGE] ${tokenMint.substring(0, 8)} is ${age < 60 ? age+'s' : Math.floor(age/60)+'m '+age%60+'s'} old`);
+  if (age === -1) { log(`[SKIP] ${tokenMint.substring(0, 8)} too old`); return; }
+  if (age === null) {
+    if (STRICT_AGE_CHECK) { log(`[SKIP] ${tokenMint.substring(0, 8)} age unknown — strict mode rejects`); return; }
+    log(`[WARN] Age unknown for ${tokenMint.substring(0, 8)} — allowing`);
+  } else {
+    log(`[AGE] ${tokenMint.substring(0, 8)} is ${age < 60 ? age+'s' : Math.floor(age/60)+'m '+age%60+'s'} old`);
+  }
 
   const now = Math.floor(Date.now() / 1000);
 
