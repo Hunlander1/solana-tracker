@@ -262,11 +262,15 @@ async function fetchFreshWallets(mint) {
   return data.fresh_holder_count ?? data.fresh_wallet_count ?? data.fresh_holders ?? data.freshHolder ?? null;
 }
 
-// ── SAME-NAME COUNT (DexScreener search by symbol) ────────────
-async function fetchSameNameCount(mint) {
-  // Step 1: get the symbol from GMGN token info
-  const tokenInfo = await fetchTokenInfo(mint);
-  const symbol = tokenInfo?.symbol;
+// ── SAME-NAME COUNT (DexScreener search by symbol from GMGN) ──
+//
+//  We already have the symbol from GMGN token info.
+//  We pass it in directly — no extra API call needed here.
+//  We search DexScreener for that symbol, count all OTHER Solana
+//  tokens with the exact same symbol created in the last 5 hours,
+//  and exclude our own mint from the count.
+//
+async function fetchSameNameCount(mint, symbol) {
   if (!symbol || symbol === 'UNKNOWN') {
     log(`[SameName] No symbol for ${mint.substring(0, 8)} — skipping`);
     return null;
@@ -274,7 +278,6 @@ async function fetchSameNameCount(mint) {
 
   log(`[SameName] Searching DexScreener for symbol: ${symbol}`);
 
-  // Step 2: search DexScreener by symbol
   const data = await httpsGet(
     'api.dexscreener.com',
     `/latest/dex/search?q=${encodeURIComponent(symbol)}`,
@@ -289,18 +292,21 @@ async function fetchSameNameCount(mint) {
   const nowSecs = Math.floor(Date.now() / 1000);
   const cutoff  = 5 * 3600; // 5 hours in seconds
 
-  // Step 3: count Solana pairs with exact symbol match created in last 5h
   const matches = data.pairs.filter(pair => {
+    // Solana only
     if (pair.chainId !== 'solana') return false;
-    const pairSymbol = pair.baseToken?.symbol?.toUpperCase();
-    if (pairSymbol !== symbol.toUpperCase()) return false;
-    const createdAt = pair.pairCreatedAt; // milliseconds epoch
-    if (!createdAt) return false;
-    const ageSecs = nowSecs - Math.floor(createdAt / 1000);
+    // Exact symbol match (case-insensitive)
+    if (pair.baseToken?.symbol?.toUpperCase() !== symbol.toUpperCase()) return false;
+    // Exclude our own token
+    if (pair.baseToken?.address === mint) return false;
+    // Must have a creation timestamp
+    if (!pair.pairCreatedAt) return false;
+    // Must be within the last 5 hours
+    const ageSecs = nowSecs - Math.floor(pair.pairCreatedAt / 1000);
     return ageSecs >= 0 && ageSecs <= cutoff;
   });
 
-  log(`[SameName] ${symbol}: ${matches.length} matching Solana tokens in last 5h (from ${data.pairs.length} total pairs)`);
+  log(`[SameName] ${symbol}: ${matches.length} other tokens in last 5h (${data.pairs.length} total pairs returned)`);
   return matches.length;
 }
 
@@ -393,9 +399,10 @@ async function buildAndSendSignal(tokenMint, walletCount, elapsed, tokenInfo) {
       if (fwStat !== undefined && fwStat !== null) freshWalletsFromInfo = fwStat;
     }
 
-    // Run same-name count and security fetch in parallel
+    // Run same-name count and security fetch in parallel.
+    // Symbol is passed directly from tokenInfo — no extra GMGN call needed.
     const [sameNameCount, freshWalletsFromSecurity] = await Promise.all([
-      fetchSameNameCount(tokenMint),  // DexScreener search by symbol
+      fetchSameNameCount(tokenMint, symbol),
       freshWalletsFromInfo === null ? fetchFreshWallets(tokenMint) : Promise.resolve(null)
     ]);
 
