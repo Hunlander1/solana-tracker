@@ -27,7 +27,7 @@ const CHAT_ID        = process.env.CHAT_ID;
 const GMGN_API_KEY   = process.env.GMGN_API_KEY;
 const SHYFT_API_KEY  = process.env.SHYFT_API_KEY;  // free Shyft key for WSS
 
-const SOL_MINT     = 'So11111111111111111111111111111111111111112';
+const SOL_MINT       = 'So11111111111111111111111111111111111111112';
 const WINDOW_SECS    = 120;
 const MAX_TOKEN_AGE  = 3600;
 const STRICT_AGE_CHECK = false; // true = reject token if age can't be confirmed (use on fast bot)
@@ -114,18 +114,19 @@ const WALLETS = [
   "nazikTJezTC3W2fxXE3wzs495PYzXMiq5o7co6YYACA",  // YZY Dev
   "BtMBMPkoNbnLF9Xn552guQq528KKXcsNBNNBre3oaQtr", // Letterbomb(horse)
   "EYfdt8cNFyyTEJKp18dcoVbgUHDnM1SK3bT2uKj9XXHc", // Penguin Dev
+  "EgQX9R3Qph1dPHE1Ysou1auSYqRGomCNmLDC28Yg77aq", // Smart 8
 ];
 const WALLET_SET = new Set(WALLETS);
 
 // ── STATE ─────────────────────────────────────────────────────
-let firedAlerts   = loadFiredAlerts();
-let activeAlerts  = {};   // tokenMint => { wallets: Set, firstSeenAt }
-let devWalletCache = {};  // tokenMint => creator_address (skip dev buys)
-let creationCache = {};
-let skipCache     = {};
-let subIdToWallet = {};   // subscription id => wallet address
-let ws            = null;
-let wsReady       = false;
+let firedAlerts    = loadFiredAlerts();
+let activeAlerts   = {};   // tokenMint => { wallets: Set, firstSeenAt }
+let devWalletCache = {};   // tokenMint => creator_address (skip dev buys)
+let creationCache  = {};
+let skipCache      = {};
+let subIdToWallet  = {};   // subscription id => wallet address
+let ws             = null;
+let wsReady        = false;
 let reconnectDelay = 5000;
 let usingFallback  = false;
 let pendingSigs    = new Set(); // debounce: avoid fetching same sig twice
@@ -205,7 +206,6 @@ function httpsPost(url, body) {
 }
 
 // ── SOLANA RPC: getTransaction ────────────────────────────────
-// Called when a log notification arrives — fetches full tx to extract mint
 async function getTransaction(signature) {
   const result = await httpsPost(HTTP_RPC, {
     jsonrpc: '2.0',
@@ -262,33 +262,46 @@ async function fetchFreshWallets(mint) {
   return data.fresh_holder_count ?? data.fresh_wallet_count ?? data.fresh_holders ?? data.freshHolder ?? null;
 }
 
+// ── SAME-NAME COUNT (DexScreener search by symbol) ────────────
 async function fetchSameNameCount(mint) {
-  // Uses GMGN connection_history — same API key, no DexScreener dependency
-  // Returns count of tokens with same name/symbol launched in last 5 hours
-  log(`[SameName] Fetching connection history for ${mint.substring(0, 8)}...`);
-  for (let attempt = 0; attempt < 3; attempt++) {
-    const data = await gmgnGet('/v1/token/connection_history', {
-      chain: 'sol',
-      address: mint,
-      limit: '100',
-    });
-    if (data !== null) {
-      const items = data.history ?? data.items ?? data.tokens ?? data ?? [];
-      const arr = Array.isArray(items) ? items : [];
-      const nowSecs = Math.floor(Date.now() / 1000);
-      const cutoff  = 5 * 3600; // 5 hours in seconds
-      const count = arr.filter(t => {
-        const ts = t.creation_timestamp ?? t.created_at ?? t.open_timestamp ?? 0;
-        return ts && nowSecs - ts <= cutoff;
-      }).length;
-      log(`[SameName] ${mint.substring(0, 8)}: ${arr.length} connected tokens, ${count} in last 5h`);
-      return count;
-    }
-    log(`[SameName] attempt ${attempt + 1} failed for ${mint.substring(0, 8)}`);
-    if (attempt < 2) await new Promise(r => setTimeout(r, 2000));
+  // Step 1: get the symbol from GMGN token info
+  const tokenInfo = await fetchTokenInfo(mint);
+  const symbol = tokenInfo?.symbol;
+  if (!symbol || symbol === 'UNKNOWN') {
+    log(`[SameName] No symbol for ${mint.substring(0, 8)} — skipping`);
+    return null;
   }
-  log(`[SameName] All attempts failed for ${mint.substring(0, 8)}`);
-  return null;
+
+  log(`[SameName] Searching DexScreener for symbol: ${symbol}`);
+
+  // Step 2: search DexScreener by symbol
+  const data = await httpsGet(
+    'api.dexscreener.com',
+    `/latest/dex/search?q=${encodeURIComponent(symbol)}`,
+    { 'Accept': 'application/json', 'User-Agent': 'Mozilla/5.0' }
+  );
+
+  if (!data?.pairs) {
+    log(`[SameName] No pairs returned from DexScreener for ${symbol}`);
+    return null;
+  }
+
+  const nowSecs = Math.floor(Date.now() / 1000);
+  const cutoff  = 5 * 3600; // 5 hours in seconds
+
+  // Step 3: count Solana pairs with exact symbol match created in last 5h
+  const matches = data.pairs.filter(pair => {
+    if (pair.chainId !== 'solana') return false;
+    const pairSymbol = pair.baseToken?.symbol?.toUpperCase();
+    if (pairSymbol !== symbol.toUpperCase()) return false;
+    const createdAt = pair.pairCreatedAt; // milliseconds epoch
+    if (!createdAt) return false;
+    const ageSecs = nowSecs - Math.floor(createdAt / 1000);
+    return ageSecs >= 0 && ageSecs <= cutoff;
+  });
+
+  log(`[SameName] ${symbol}: ${matches.length} matching Solana tokens in last 5h (from ${data.pairs.length} total pairs)`);
+  return matches.length;
 }
 
 async function getTokenAge(mint) {
@@ -353,7 +366,7 @@ async function buildAndSendSignal(tokenMint, walletCount, elapsed, tokenInfo) {
       // Market cap: try direct field first, then calculate from price × supply
       let mc = parseFloat(tokenInfo.market_cap ?? tokenInfo.usd_market_cap);
       if (isNaN(mc) || mc === 0) {
-        const price = parseFloat(tokenInfo.price);
+        const price  = parseFloat(tokenInfo.price);
         const supply = parseFloat(tokenInfo.circulating_supply ?? tokenInfo.total_supply);
         if (!isNaN(price) && !isNaN(supply) && price > 0 && supply > 0) mc = price * supply;
       }
@@ -382,7 +395,7 @@ async function buildAndSendSignal(tokenMint, walletCount, elapsed, tokenInfo) {
 
     // Run same-name count and security fetch in parallel
     const [sameNameCount, freshWalletsFromSecurity] = await Promise.all([
-      fetchSameNameCount(tokenMint),  // uses GMGN connection_history
+      fetchSameNameCount(tokenMint),  // DexScreener search by symbol
       freshWalletsFromInfo === null ? fetchFreshWallets(tokenMint) : Promise.resolve(null)
     ]);
 
@@ -392,7 +405,6 @@ async function buildAndSendSignal(tokenMint, walletCount, elapsed, tokenInfo) {
       timeZone: 'America/Toronto', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true
     });
 
-    // Full dev wallet as copyable code, with GMGN link
     const devWalletLine = devWallet !== 'N/A'
       ? `<code>${devWallet}</code>`
       : 'N/A';
@@ -475,8 +487,6 @@ async function handleWalletBuy(trackedWallet, tokenMint) {
 async function processLogNotification(params) {
   if (!isActiveHours()) return; // 11am-6pm ET only
 
-  // Solana logsNotification structure:
-  // params = { subscription: <subId>, result: { context: { slot }, value: { signature, err, logs } } }
   const value = params?.result?.value;
   const subId = params?.subscription;
 
@@ -488,7 +498,7 @@ async function processLogNotification(params) {
   // Skip failed transactions
   if (value.err !== null && value.err !== undefined) return;
 
-  const signature = value.signature;
+  const signature    = value.signature;
   const trackedWallet = subIdToWallet[subId];
 
   if (!trackedWallet) return;
@@ -543,7 +553,6 @@ function connect(useUrl) {
     wsReady = true;
     reconnectDelay = 5000;
 
-    // Build reqId→wallet map BEFORE sending, so order doesn't matter
     WALLETS.forEach((wallet, i) => {
       const reqId = i + 1;
       reqIdToWallet[reqId] = wallet;
@@ -560,7 +569,6 @@ function connect(useUrl) {
 
     log(`[WS] All ${WALLETS.length} subscription requests sent`);
 
-    // Ping every 30s to keep connection alive
     const pingInterval = setInterval(() => {
       if (ws.readyState === WebSocket.OPEN) {
         ws.ping();
@@ -575,8 +583,6 @@ function connect(useUrl) {
     try { msg = JSON.parse(data.toString()); }
     catch { return; }
 
-    // Subscription confirmation: Solana returns { id: <our req id>, result: <sub id> }
-    // Use reqIdToWallet (reliable) not array index (order-dependent)
     if (msg.id !== undefined && msg.result !== undefined && typeof msg.result === 'number' && !msg.method) {
       const wallet = reqIdToWallet[msg.id];
       if (wallet) {
@@ -588,9 +594,8 @@ function connect(useUrl) {
       return;
     }
 
-    // Log notification — log every single one so we know they're arriving
     if (msg.method === 'logsNotification') {
-      const subId = msg.params?.subscription;
+      const subId  = msg.params?.subscription;
       const wallet = subIdToWallet[subId];
       log(`[WS] logsNotification subId=${subId} mapped=${wallet ? wallet.substring(0,8) : 'UNKNOWN'}`);
       processLogNotification(msg.params).catch(e => log(`[ERR] processLogNotification: ${e.message}`));
@@ -605,7 +610,6 @@ function connect(useUrl) {
     wsReady = false;
     log(`[WS] Disconnected (code: ${code}). Reconnecting in ${reconnectDelay / 1000}s...`);
 
-    // Try fallback endpoint if primary keeps failing
     if (reconnectDelay >= 30000 && !usingFallback && WSS_PRIMARY !== WSS_FALLBACK) {
       log(`[WS] Switching to fallback endpoint`);
       usingFallback = true;
@@ -613,12 +617,11 @@ function connect(useUrl) {
     }
 
     setTimeout(() => connect(), reconnectDelay);
-    reconnectDelay = Math.min(reconnectDelay * 2, 60000); // exponential backoff, max 60s
+    reconnectDelay = Math.min(reconnectDelay * 2, 60000);
   });
 }
 
 // ── HEALTH CHECK SERVER ───────────────────────────────────────
-// Keeps Render from spinning down the service (free tier spins down on no HTTP traffic)
 const server = http.createServer((req, res) => {
   const subCount = Object.keys(subIdToWallet).length;
   res.writeHead(200, { 'Content-Type': 'text/plain' });
@@ -641,8 +644,6 @@ log(`[START] WSS primary: ${WSS_PRIMARY.replace(/api_key=[^&]+/, 'api_key=***')}
 connect();
 
 // ── SELF-PING (keeps Render free tier from sleeping) ──────────
-// Render spins down free services after ~15min of no HTTP traffic.
-// We ping our own health endpoint every 10 minutes to stay awake.
 const RENDER_URL = process.env.RENDER_EXTERNAL_URL || null;
 setInterval(() => {
   if (!RENDER_URL) return;
@@ -656,4 +657,4 @@ setInterval(() => {
   } catch(e) {
     log(`[PING] Self-ping error: ${e.message}`);
   }
-}, 10 * 60 * 1000); // every 10 minutes
+}, 10 * 60 * 1000);
