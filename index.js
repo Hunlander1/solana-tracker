@@ -28,7 +28,7 @@ const GMGN_API_KEY   = process.env.GMGN_API_KEY;
 const SHYFT_API_KEY  = process.env.SHYFT_API_KEY;  // free Shyft key for WSS
 
 const SOL_MINT       = 'So11111111111111111111111111111111111111112';
-const WINDOW_SECS    = 120;
+const WINDOW_SECS    = 180;
 const MAX_TOKEN_AGE  = 3600;
 const STRICT_AGE_CHECK = false; // true = reject token if age can't be confirmed (use on fast bot)
 
