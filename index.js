@@ -1,19 +1,6 @@
 // ============================================================
 //  SOLANA MULTI-WALLET TRACKER — WEBSOCKET EDITION
 //  Zero credits. No webhook provider. Runs forever for free.
-//
-//  How it works:
-//  - Opens a persistent WebSocket to a free Solana RPC
-//  - Subscribes to logsSubscribe for each of the 84 wallets
-//  - When a wallet transacts, Solana pushes the signature
-//  - We fetch the full transaction to extract the token mint
-//  - Coordination logic + GMGN enrichment + Telegram signal
-//
-//  Render setup:
-//  - Change service type from "Web Service" to "Background Worker"
-//    (or keep as Web Service — the /health route keeps it alive)
-//  - Environment vars: TELEGRAM_TOKEN, CHAT_ID, GMGN_API_KEY,
-//                      SHYFT_API_KEY (your free Shyft key for WSS)
 // ============================================================
 
 const https   = require('https');
@@ -25,24 +12,22 @@ const WebSocket = require('ws');
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
 const CHAT_ID        = process.env.CHAT_ID;
 const GMGN_API_KEY   = process.env.GMGN_API_KEY;
-const SHYFT_API_KEY  = process.env.SHYFT_API_KEY;  // free Shyft key for WSS
+const SHYFT_API_KEY  = process.env.SHYFT_API_KEY;
 
-const SOL_MINT       = 'So11111111111111111111111111111111111111112';
-const WINDOW_SECS    = 180;
-const MAX_TOKEN_AGE  = 3600;
-const STRICT_AGE_CHECK = false; // true = reject token if age can't be confirmed (use on fast bot)
+const SOL_MINT         = 'So11111111111111111111111111111111111111112';
+const WINDOW_SECS      = 180;
+const MAX_TOKEN_AGE    = 3600;
+const STRICT_AGE_CHECK = false;
 
-// WSS endpoints — primary is Shyft (free, unlimited RPC), fallback is public Solana
-// HTTP RPC for getTransaction calls
-const WSS_PRIMARY   = SHYFT_API_KEY
+const WSS_PRIMARY  = SHYFT_API_KEY
   ? `wss://rpc.shyft.to?api_key=${SHYFT_API_KEY}`
   : 'wss://api.mainnet-beta.solana.com';
-const WSS_FALLBACK  = 'wss://api.mainnet-beta.solana.com';
-const HTTP_RPC      = SHYFT_API_KEY
+const WSS_FALLBACK = 'wss://api.mainnet-beta.solana.com';
+const HTTP_RPC     = SHYFT_API_KEY
   ? `https://rpc.shyft.to?api_key=${SHYFT_API_KEY}`
   : 'https://api.mainnet-beta.solana.com';
 
-// ── FIRED ALERTS (file-backed, survives restarts) ─────────────
+// ── FIRED ALERTS ──────────────────────────────────────────────
 const FIRED_FILE = '/tmp/fired_alerts.json';
 
 function loadFiredAlerts() {
@@ -120,16 +105,36 @@ const WALLET_SET = new Set(WALLETS);
 
 // ── STATE ─────────────────────────────────────────────────────
 let firedAlerts    = loadFiredAlerts();
-let activeAlerts   = {};   // tokenMint => { wallets: Set, firstSeenAt }
-let devWalletCache = {};   // tokenMint => creator_address (skip dev buys)
+let activeAlerts   = {};
+let devWalletCache = {};
 let creationCache  = {};
 let skipCache      = {};
-let subIdToWallet  = {};   // subscription id => wallet address
+let subIdToWallet  = {};
 let ws             = null;
 let wsReady        = false;
 let reconnectDelay = 5000;
 let usingFallback  = false;
-let pendingSigs    = new Set(); // debounce: avoid fetching same sig twice
+let pendingSigs    = new Set();
+
+// ── UNIFIED TOKEN INFO CACHE ──────────────────────────────────
+// Guarantees at most ONE fetchTokenInfo call per mint, no matter
+// how many wallets buy the same token simultaneously.
+// Concurrent calls share the same in-flight promise instead of
+// each firing their own GMGN request — fixes 429 rate limiting.
+let tokenInfoCache    = {};  // mint => result (cached after first call)
+let tokenInfoInflight = {};  // mint => Promise (deduplicates concurrent calls)
+
+async function getCachedTokenInfo(mint) {
+  if (mint in tokenInfoCache) return tokenInfoCache[mint];
+  if (tokenInfoInflight[mint]) return tokenInfoInflight[mint];
+  tokenInfoInflight[mint] = fetchTokenInfo(mint).then(info => {
+    tokenInfoCache[mint] = info;
+    delete tokenInfoInflight[mint];
+    setTimeout(() => delete tokenInfoCache[mint], 600000); // clear after 10 min
+    return info;
+  });
+  return tokenInfoInflight[mint];
+}
 
 log(`[INIT] Loaded ${firedAlerts.size} previously fired contracts`);
 
@@ -229,7 +234,6 @@ function extractMint(tx) {
   const preBals  = meta.preTokenBalances  ?? [];
   const preOwned = new Set(preBals.map(b => b.mint));
 
-  // Prefer a mint that appeared in post but NOT in pre (newly received)
   let mint = postBals.find(b => b.mint && b.mint !== SOL_MINT && !preOwned.has(b.mint))?.mint;
   if (!mint) mint = postBals.find(b => b.mint && b.mint !== SOL_MINT)?.mint;
   return mint ?? null;
@@ -262,14 +266,7 @@ async function fetchFreshWallets(mint) {
   return data.fresh_holder_count ?? data.fresh_wallet_count ?? data.fresh_holders ?? data.freshHolder ?? null;
 }
 
-// ── SAME-NAME COUNT (DexScreener search by symbol from GMGN) ──
-//
-//  We already have the symbol from GMGN token info.
-//  We pass it in directly — no extra API call needed here.
-//  We search DexScreener for that symbol, count all OTHER Solana
-//  tokens with the exact same symbol created in the last 5 hours,
-//  and exclude our own mint from the count.
-//
+// ── SAME-NAME COUNT ───────────────────────────────────────────
 async function fetchSameNameCount(mint, symbol) {
   if (!symbol || symbol === 'UNKNOWN') {
     log(`[SameName] No symbol for ${mint.substring(0, 8)} — skipping`);
@@ -290,18 +287,13 @@ async function fetchSameNameCount(mint, symbol) {
   }
 
   const nowSecs = Math.floor(Date.now() / 1000);
-  const cutoff  = 5 * 3600; // 5 hours in seconds
+  const cutoff  = 5 * 3600;
 
   const matches = data.pairs.filter(pair => {
-    // Solana only
     if (pair.chainId !== 'solana') return false;
-    // Exact symbol match (case-insensitive)
     if (pair.baseToken?.symbol?.toUpperCase() !== symbol.toUpperCase()) return false;
-    // Exclude our own token
     if (pair.baseToken?.address === mint) return false;
-    // Must have a creation timestamp
     if (!pair.pairCreatedAt) return false;
-    // Must be within the last 5 hours
     const ageSecs = nowSecs - Math.floor(pair.pairCreatedAt / 1000);
     return ageSecs >= 0 && ageSecs <= cutoff;
   });
@@ -314,7 +306,8 @@ async function getTokenAge(mint) {
   const now = Math.floor(Date.now() / 1000);
   if (skipCache[mint]) return -1;
   if (creationCache[mint]) return now - creationCache[mint];
-  const info = await fetchTokenInfo(mint);
+  // Use shared cache — no extra GMGN call if info already fetched
+  const info = await getCachedTokenInfo(mint);
   if (!info) return null;
   const createdAt = info.creation_timestamp;
   if (!createdAt) return null;
@@ -369,7 +362,6 @@ async function buildAndSendSignal(tokenMint, walletCount, elapsed, tokenInfo) {
       }
       const liq = parseFloat(tokenInfo.liquidity);
       if (!isNaN(liq)) liquidityStr = `$${liq.toLocaleString('en-US', { maximumFractionDigits: 0 })}`;
-      // Market cap: try direct field first, then calculate from price × supply
       let mc = parseFloat(tokenInfo.market_cap ?? tokenInfo.usd_market_cap);
       if (isNaN(mc) || mc === 0) {
         const price  = parseFloat(tokenInfo.price);
@@ -378,11 +370,9 @@ async function buildAndSendSignal(tokenMint, walletCount, elapsed, tokenInfo) {
       }
       if (!isNaN(mc) && mc > 0) marketCapStr = `$${mc.toLocaleString('en-US', { maximumFractionDigits: 0 })}`;
 
-      // Dev wallet address
       const creatorAddr = tokenInfo.dev?.creator_address;
       if (creatorAddr) devWallet = creatorAddr;
 
-      // Dev all-time-high token
       const athInfo = tokenInfo.dev?.ath_token_info;
       if (athInfo?.ath_mc) {
         const athMc = parseFloat(athInfo.ath_mc);
@@ -394,13 +384,10 @@ async function buildAndSendSignal(tokenMint, walletCount, elapsed, tokenInfo) {
         }
       }
 
-      // Fresh wallets — prefer wallet_tags_stat (already in token info, no extra call)
       const fwStat = tokenInfo.wallet_tags_stat?.fresh_wallets;
       if (fwStat !== undefined && fwStat !== null) freshWalletsFromInfo = fwStat;
     }
 
-    // Run same-name count and security fetch in parallel.
-    // Symbol is passed directly from tokenInfo — no extra GMGN call needed.
     const [sameNameCount, freshWalletsFromSecurity] = await Promise.all([
       fetchSameNameCount(tokenMint, symbol),
       freshWalletsFromInfo === null ? fetchFreshWallets(tokenMint) : Promise.resolve(null)
@@ -412,9 +399,7 @@ async function buildAndSendSignal(tokenMint, walletCount, elapsed, tokenInfo) {
       timeZone: 'America/Toronto', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true
     });
 
-    const devWalletLine = devWallet !== 'N/A'
-      ? `<code>${devWallet}</code>`
-      : 'N/A';
+    const devWalletLine = devWallet !== 'N/A' ? `<code>${devWallet}</code>` : 'N/A';
 
     sendTelegram(
       `🚨 <b>3-Wallet Signal</b>\n\n` +
@@ -443,11 +428,11 @@ async function handleWalletBuy(trackedWallet, tokenMint) {
     return;
   }
 
-  // Fetch and cache the dev wallet address — skip buy if wallet IS the dev
+  // Use shared cache for dev wallet check
   if (!devWalletCache[tokenMint]) {
-    const devInfo = await fetchTokenInfo(tokenMint);
+    const devInfo = await getCachedTokenInfo(tokenMint);
     devWalletCache[tokenMint] = devInfo?.dev?.creator_address ?? 'unknown';
-    setTimeout(() => delete devWalletCache[tokenMint], 600000); // clear after 10 min
+    setTimeout(() => delete devWalletCache[tokenMint], 600000);
   }
   if (devWalletCache[tokenMint] && devWalletCache[tokenMint] !== 'unknown' &&
       trackedWallet === devWalletCache[tokenMint]) {
@@ -485,14 +470,15 @@ async function handleWalletBuy(trackedWallet, tokenMint) {
     const elapsed = now - entry.firstSeenAt;
     saveFiredAlert(tokenMint);
     delete activeAlerts[tokenMint];
-    const tokenInfo = await fetchTokenInfo(tokenMint);
+    // Use shared cache for final signal fetch too
+    const tokenInfo = await getCachedTokenInfo(tokenMint);
     await buildAndSendSignal(tokenMint, count, elapsed, tokenInfo);
   }
 }
 
 // ── PROCESS LOG NOTIFICATION ──────────────────────────────────
 async function processLogNotification(params) {
-  if (!isActiveHours()) return; // 11am-6pm ET only
+  if (!isActiveHours()) return;
 
   const value = params?.result?.value;
   const subId = params?.subscription;
@@ -502,16 +488,14 @@ async function processLogNotification(params) {
     return;
   }
 
-  // Skip failed transactions
   if (value.err !== null && value.err !== undefined) return;
 
-  const signature    = value.signature;
+  const signature     = value.signature;
   const trackedWallet = subIdToWallet[subId];
 
   if (!trackedWallet) return;
   log(`[LOG HIT] wallet ${trackedWallet.substring(0, 8)} | sig ${signature.substring(0, 12)}...`);
 
-  // Debounce: same sig can fire for multiple wallet subs if two tracked wallets are in same tx
   if (pendingSigs.has(signature)) {
     log(`[DEBOUNCE] ${signature.substring(0, 12)} already being processed`);
     return;
@@ -519,7 +503,6 @@ async function processLogNotification(params) {
   pendingSigs.add(signature);
   setTimeout(() => pendingSigs.delete(signature), 30000);
 
-  // Fetch full transaction to extract the token mint
   let tx = null;
   for (let attempt = 0; attempt < 3; attempt++) {
     tx = await getTransaction(signature);
@@ -544,7 +527,7 @@ async function processLogNotification(params) {
 }
 
 // ── WEBSOCKET ─────────────────────────────────────────────────
-let reqIdToWallet = {};  // request id => wallet (set when we send subscribe)
+let reqIdToWallet = {};
 
 function connect(useUrl) {
   const url = useUrl ?? (usingFallback ? WSS_FALLBACK : WSS_PRIMARY);
