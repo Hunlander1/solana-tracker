@@ -1,6 +1,7 @@
 // ============================================================
-//  SOLANA MULTI-WALLET TRACKER — WEBSOCKET EDITION
+//  SOLANA MULTI-WALLET TRACKER — WEBSOCKET EDITION (slow bot)
 //  Zero credits. No webhook provider. Runs forever for free.
+//  + SELL SIGNAL TRACKER — fires when all coordinated wallets exit
 // ============================================================
 
 const https   = require('https');
@@ -116,21 +117,31 @@ let reconnectDelay = 5000;
 let usingFallback  = false;
 let pendingSigs    = new Set();
 
+// ── SELL WATCHLIST ────────────────────────────────────────────
+// sellWatchlist[tokenMint] = {
+//   wallets: Set<walletAddress>,  — wallets that need to sell
+//   exited:  Set<walletAddress>,  — wallets confirmed fully sold
+//   symbol:  string,
+//   signalTime: number,
+// }
+let sellWatchlist = {};
+
 // ── UNIFIED TOKEN INFO CACHE ──────────────────────────────────
-// Guarantees at most ONE fetchTokenInfo call per mint, no matter
-// how many wallets buy the same token simultaneously.
-// Concurrent calls share the same in-flight promise instead of
-// each firing their own GMGN request — fixes 429 rate limiting.
-let tokenInfoCache    = {};  // mint => result (cached after first call)
-let tokenInfoInflight = {};  // mint => Promise (deduplicates concurrent calls)
+let tokenInfoCache    = {};
+let tokenInfoInflight = {};
 
 async function getCachedTokenInfo(mint) {
   if (mint in tokenInfoCache) return tokenInfoCache[mint];
   if (tokenInfoInflight[mint]) return tokenInfoInflight[mint];
   tokenInfoInflight[mint] = fetchTokenInfo(mint).then(info => {
-    tokenInfoCache[mint] = info;
+    // Only cache if we got a valid response WITH creation_timestamp.
+    // A response missing creation_timestamp is incomplete — caching it
+    // would cause the age check to pass as null on all future calls.
+    if (info && info.creation_timestamp) {
+      tokenInfoCache[mint] = info;
+      setTimeout(() => delete tokenInfoCache[mint], 600000);
+    }
     delete tokenInfoInflight[mint];
-    setTimeout(() => delete tokenInfoCache[mint], 600000); // clear after 10 min
     return info;
   });
   return tokenInfoInflight[mint];
@@ -145,6 +156,17 @@ setInterval(() => {
     if (now - activeAlerts[mint].firstSeenAt > WINDOW_SECS) delete activeAlerts[mint];
   }
 }, 60000);
+
+// Cleanup stale sell watchlist entries after 6 hours
+setInterval(() => {
+  const now = Math.floor(Date.now() / 1000);
+  for (const mint of Object.keys(sellWatchlist)) {
+    if (now - sellWatchlist[mint].signalTime > 6 * 3600) {
+      log(`[SELL] Watchlist entry for ${mint.substring(0, 8)} expired (6h) — removing`);
+      delete sellWatchlist[mint];
+    }
+  }
+}, 5 * 60 * 1000);
 
 // ── HELPERS ───────────────────────────────────────────────────
 function log(msg) {
@@ -239,6 +261,92 @@ function extractMint(tx) {
   return mint ?? null;
 }
 
+// ── SELL DETECTION ────────────────────────────────────────────
+function extractFullSell(tx, trackedWallet) {
+  const meta = tx?.meta;
+  if (!meta) return null;
+
+  const preBals  = meta.preTokenBalances  ?? [];
+  const postBals = meta.postTokenBalances ?? [];
+
+  const rawKeys     = tx?.transaction?.message?.accountKeys ?? [];
+  const accountKeys = rawKeys.map(k => (typeof k === 'string' ? k : (k?.pubkey ?? '')));
+
+  function resolveOwner(balEntry) {
+    if (balEntry.owner) return balEntry.owner;
+    const idx = balEntry.accountIndex;
+    if (idx !== undefined && accountKeys[idx]) return accountKeys[idx];
+    return null;
+  }
+
+  for (const pre of preBals) {
+    if (!pre.mint || pre.mint === SOL_MINT) continue;
+    if (!sellWatchlist[pre.mint]) continue;
+
+    const ownerOfPre = resolveOwner(pre);
+    if (!ownerOfPre || ownerOfPre !== trackedWallet) continue;
+
+    const preAmt = parseFloat(pre.uiTokenAmount?.uiAmountString ?? pre.uiTokenAmount?.amount ?? '0');
+    if (preAmt <= 0) continue;
+
+    const post    = postBals.find(p => p.mint === pre.mint && resolveOwner(p) === trackedWallet);
+    const postAmt = post ? parseFloat(post.uiTokenAmount?.uiAmountString ?? post.uiTokenAmount?.amount ?? '0') : 0;
+
+    if (postAmt === 0) {
+      log(`[SELL] Full exit detected: wallet ${trackedWallet.substring(0, 8)} sold all of ${pre.mint.substring(0, 8)}`);
+      return pre.mint;
+    }
+  }
+
+  return null;
+}
+
+// ── SELL SIGNAL ───────────────────────────────────────────────
+function sendSellSignal(tokenMint, entry) {
+  const elapsed    = Math.floor(Date.now() / 1000) - entry.signalTime;
+  const mins       = Math.floor(elapsed / 60);
+  const secs       = elapsed % 60;
+  const elapsedStr = mins > 0 ? `${mins}m ${secs}s` : `${secs}s`;
+  const walletCount = entry.wallets.size;
+
+  const signalTime = new Date().toLocaleTimeString('en-US', {
+    timeZone: 'America/Toronto', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true
+  });
+
+  sendTelegram(
+    `🚨 <b>SELL Signal — All Wallets Exited</b>\n\n` +
+    `Token: #${entry.symbol}\n` +
+    `Contract: <code>${tokenMint}</code>\n` +
+    `Wallets Exited: ${walletCount}/${walletCount}\n` +
+    `Time Since Buy Signal: ${elapsedStr}\n` +
+    `Signal Time: ${signalTime}\n\n` +
+    `<a href="https://gmgn.ai/sol/token/${tokenMint}">GMGN</a>`
+  );
+
+  log(`[SELL] 🚨 Sell signal fired for #${entry.symbol} (${tokenMint.substring(0, 8)}) | ${walletCount} wallets exited in ${elapsedStr}`);
+}
+
+// ── HANDLE SELL TX ────────────────────────────────────────────
+async function handlePotentialSell(trackedWallet, tx) {
+  const soldMint = extractFullSell(tx, trackedWallet);
+  if (!soldMint) return;
+
+  const entry = sellWatchlist[soldMint];
+  if (!entry) return;
+
+  if (!entry.wallets.has(trackedWallet)) return;
+
+  entry.exited.add(trackedWallet);
+  const remaining = entry.wallets.size - entry.exited.size;
+
+  log(`[SELL] ${trackedWallet.substring(0, 8)} exited #${entry.symbol} | ${entry.exited.size}/${entry.wallets.size} exited | ${remaining} remaining`);
+
+  if (entry.exited.size >= entry.wallets.size) {
+    sendSellSignal(soldMint, entry);
+    delete sellWatchlist[soldMint];
+  }
+}
+
 // ── GMGN ──────────────────────────────────────────────────────
 async function gmgnGet(path, params = {}) {
   params.timestamp = Math.floor(Date.now() / 1000).toString();
@@ -266,80 +374,89 @@ async function fetchFreshWallets(mint) {
   return data.fresh_holder_count ?? data.fresh_wallet_count ?? data.fresh_holders ?? data.freshHolder ?? null;
 }
 
-// ── SAME-NAME COUNT ───────────────────────────────────────────
-// Uses https.get with manual redirect handling because DexScreener
-// issues 301/302 redirects that https.request does not follow.
-async function fetchSameNameCount(mint, symbol) {
-  if (!symbol || symbol === 'UNKNOWN') {
-    log(`[SameName] No symbol for ${mint.substring(0, 8)} — skipping`);
-    return null;
-  }
-
-  log(`[Dex] Fetching same-name count for ${symbol}...`);
-
+// ── DEXSCREENER FETCH HELPER ──────────────────────────────────
+async function dexFetch(url) {
+  const reqHeaders = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+    'Accept': 'application/json',
+  };
   for (let attempt = 0; attempt < 3; attempt++) {
     const result = await new Promise((resolve) => {
-      const url = `https://api.dexscreener.com/latest/dex/search?q=${encodeURIComponent(symbol)}`;
-      const reqHeaders = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-        'Accept': 'application/json',
-      };
-
       const req = https.get(url, { headers: reqHeaders }, (res) => {
-        log(`[Dex] HTTP ${res.statusCode} for ${symbol}`);
-
-        // Manual redirect handling
+        log(`[Dex] HTTP ${res.statusCode}`);
         if ([301, 302, 307, 308].includes(res.statusCode) && res.headers.location) {
           res.resume();
-          const redirectReq = https.get(res.headers.location, { headers: reqHeaders }, (res2) => {
-            let data = '';
-            res2.on('data', c => data += c);
-            res2.on('end', () => {
-              try { resolve(JSON.parse(data)); }
-              catch { log(`[Dex] Redirect parse fail`); resolve(null); }
-            });
+          const rr = https.get(res.headers.location, { headers: reqHeaders }, (res2) => {
+            let d = '';
+            res2.on('data', c => d += c);
+            res2.on('end', () => { try { resolve(JSON.parse(d)); } catch { resolve(null); } });
           });
-          redirectReq.on('error', (e) => { log(`[Dex] Redirect error: ${e.message}`); resolve(null); });
-          redirectReq.setTimeout(15000, () => { redirectReq.destroy(); resolve(null); });
+          rr.on('error', () => resolve(null));
+          rr.setTimeout(15000, () => { rr.destroy(); resolve(null); });
           return;
         }
-
         if (res.statusCode !== 200) { res.resume(); resolve(null); return; }
-        let data = '';
-        res.on('data', c => data += c);
-        res.on('end', () => {
-          try { resolve(JSON.parse(data)); }
-          catch { log(`[Dex] Parse fail`); resolve(null); }
-        });
+        let d = '';
+        res.on('data', c => d += c);
+        res.on('end', () => { try { resolve(JSON.parse(d)); } catch { resolve(null); } });
       });
       req.on('error', (e) => { log(`[Dex] Error: ${e.message}`); resolve(null); });
       req.setTimeout(15000, () => { req.destroy(); log(`[Dex] Timeout`); resolve(null); });
     });
+    if (result) return result;
+    if (attempt < 2) await new Promise(r => setTimeout(r, 2000));
+  }
+  return null;
+}
 
-    if (result) {
-      const pairs   = result.pairs ?? result.data ?? [];
-      const nowSecs = Math.floor(Date.now() / 1000);
-      const cutoff  = 5 * 3600;
+// ── SAME-NAME COUNT ───────────────────────────────────────────
+// Path 1: search by symbol. Path 2: direct mint lookup (fallback).
+// Returns 0 or more always — null only if both paths fully fail.
+async function fetchSameNameCount(mint, symbol) {
+  const nowSecs = Math.floor(Date.now() / 1000);
+  const cutoff  = 5 * 3600;
 
-      const matches = pairs.filter(pair => {
-        if ((pair.chainId ?? pair.chain_id) !== 'solana') return false;
-        if (pair.baseToken?.symbol?.toUpperCase() !== symbol.toUpperCase()) return false;
-        if (pair.baseToken?.address === mint) return false;
-        const createdAt = pair.pairCreatedAt ?? pair.pair_created_at;
-        if (!createdAt) return false;
-        const ageSecs = nowSecs - Math.floor(createdAt / 1000);
-        return ageSecs >= 0 && ageSecs <= cutoff;
-      });
-
-      log(`[Dex] ${symbol}: ${matches.length} other tokens in last 5h (${pairs.length} total pairs)`);
-      return matches.length;
-    }
-
-    log(`[Dex] attempt ${attempt + 1} got null for ${symbol}`);
-    if (attempt < 2) await new Promise(r => setTimeout(r, 3000));
+  function countMatches(pairs, sym, excludeMint) {
+    return pairs.filter(pair => {
+      if ((pair.chainId ?? pair.chain_id) !== 'solana') return false;
+      if (pair.baseToken?.symbol?.toUpperCase() !== sym.toUpperCase()) return false;
+      if (pair.baseToken?.address === excludeMint) return false;
+      const createdAt = pair.pairCreatedAt ?? pair.pair_created_at;
+      if (!createdAt) return false;
+      const ageSecs = nowSecs - Math.floor(createdAt / 1000);
+      return ageSecs >= 0 && ageSecs <= cutoff;
+    }).length;
   }
 
-  log(`[Dex] All attempts failed for ${symbol}`);
+  // Path 1: search by symbol
+  if (symbol && symbol !== 'UNKNOWN') {
+    log(`[Dex] Fetching same-name count by symbol for ${symbol}...`);
+    const r = await dexFetch(`https://api.dexscreener.com/latest/dex/search?q=${encodeURIComponent(symbol)}`);
+    if (r) {
+      const pairs = r.pairs ?? r.data ?? [];
+      const count = countMatches(pairs, symbol, mint);
+      log(`[Dex] ${symbol}: ${count} other tokens in last 5h via symbol search (${pairs.length} total pairs)`);
+      return count;
+    }
+    log(`[Dex] Symbol search failed for ${symbol} — trying direct mint lookup...`);
+  }
+
+  // Path 2: direct lookup by mint address
+  log(`[Dex] Fetching same-name count by mint for ${mint.substring(0, 8)}...`);
+  const r2 = await dexFetch(`https://api.dexscreener.com/latest/dex/tokens/${mint}`);
+  if (r2) {
+    const pairs          = r2.pairs ?? r2.data ?? [];
+    const resolvedSymbol = (symbol && symbol !== 'UNKNOWN') ? symbol : (pairs[0]?.baseToken?.symbol ?? null);
+    if (!resolvedSymbol) {
+      log(`[Dex] No symbol resolvable for ${mint.substring(0, 8)} — returning 0`);
+      return 0;
+    }
+    const count = countMatches(pairs, resolvedSymbol, mint);
+    log(`[Dex] ${resolvedSymbol}: ${count} other tokens in last 5h via mint lookup`);
+    return count;
+  }
+
+  log(`[Dex] Both paths failed for ${mint.substring(0, 8)} — returning null`);
   return null;
 }
 
@@ -347,10 +464,10 @@ async function getTokenAge(mint) {
   const now = Math.floor(Date.now() / 1000);
   if (skipCache[mint]) return -1;
   if (creationCache[mint]) return now - creationCache[mint];
-  // Use shared cache — no extra GMGN call if info already fetched
   const info = await getCachedTokenInfo(mint);
   if (!info) return null;
   const createdAt = info.creation_timestamp;
+  // If creation_timestamp is missing, treat as unknown regardless of STRICT_AGE_CHECK
   if (!createdAt) return null;
   creationCache[mint] = createdAt;
   const age = now - createdAt;
@@ -383,7 +500,7 @@ function sendTelegram(message) {
 }
 
 // ── SIGNAL ────────────────────────────────────────────────────
-async function buildAndSendSignal(tokenMint, walletCount, elapsed, tokenInfo) {
+async function buildAndSendSignal(tokenMint, walletCount, elapsed, tokenInfo, coordinatedWallets) {
   try {
     const now = Math.floor(Date.now() / 1000);
     let symbol = 'UNKNOWN', mintTimeStr = 'N/A', ageStr = 'N/A';
@@ -436,6 +553,18 @@ async function buildAndSendSignal(tokenMint, walletCount, elapsed, tokenInfo) {
 
     const freshWallets = freshWalletsFromInfo ?? freshWalletsFromSecurity;
 
+    // ── REGISTER SELL WATCHLIST ───────────────────────────────
+    // Only reached after buy signal is confirmed to fire.
+    if (coordinatedWallets && coordinatedWallets.size > 0) {
+      sellWatchlist[tokenMint] = {
+        wallets:    new Set(coordinatedWallets),
+        exited:     new Set(),
+        symbol:     symbol !== 'UNKNOWN' ? symbol : tokenMint.substring(0, 8),
+        signalTime: Math.floor(Date.now() / 1000),
+      };
+      log(`[SELL] Watching ${coordinatedWallets.size} wallets for exits on #${sellWatchlist[tokenMint].symbol} (${tokenMint.substring(0, 8)})`);
+    }
+
     const signalTime = new Date().toLocaleTimeString('en-US', {
       timeZone: 'America/Toronto', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true
     });
@@ -469,7 +598,6 @@ async function handleWalletBuy(trackedWallet, tokenMint) {
     return;
   }
 
-  // Use shared cache for dev wallet check
   if (!devWalletCache[tokenMint]) {
     const devInfo = await getCachedTokenInfo(tokenMint);
     devWalletCache[tokenMint] = devInfo?.dev?.creator_address ?? 'unknown';
@@ -484,8 +612,14 @@ async function handleWalletBuy(trackedWallet, tokenMint) {
   const age = await getTokenAge(tokenMint);
   if (age === -1) { log(`[SKIP] ${tokenMint.substring(0, 8)} too old`); return; }
   if (age === null) {
-    if (STRICT_AGE_CHECK) { log(`[SKIP] ${tokenMint.substring(0, 8)} age unknown — strict mode rejects`); return; }
-    log(`[WARN] Age unknown for ${tokenMint.substring(0, 8)} — allowing`);
+    // Null means creation_timestamp was missing from tokenInfo — always reject.
+    // STRICT_AGE_CHECK=false only allows tokens where age is genuinely unknown
+    // from a failed API call, not tokens with bad/incomplete data.
+    if (STRICT_AGE_CHECK) {
+      log(`[SKIP] ${tokenMint.substring(0, 8)} age unknown — strict mode rejects`);
+      return;
+    }
+    log(`[WARN] Age unknown for ${tokenMint.substring(0, 8)} — allowing (non-strict)`);
   } else {
     log(`[AGE] ${tokenMint.substring(0, 8)} is ${age < 60 ? age+'s' : Math.floor(age/60)+'m '+age%60+'s'} old`);
   }
@@ -508,19 +642,17 @@ async function handleWalletBuy(trackedWallet, tokenMint) {
   log(`[COUNT] ${count}/3 for ${tokenMint.substring(0, 8)} within ${now - entry.firstSeenAt}s`);
 
   if (count >= 3) {
-    const elapsed = now - entry.firstSeenAt;
+    const elapsed            = now - entry.firstSeenAt;
+    const coordinatedWallets = new Set(entry.wallets);
     saveFiredAlert(tokenMint);
     delete activeAlerts[tokenMint];
-    // Use shared cache for final signal fetch too
     const tokenInfo = await getCachedTokenInfo(tokenMint);
-    await buildAndSendSignal(tokenMint, count, elapsed, tokenInfo);
+    await buildAndSendSignal(tokenMint, count, elapsed, tokenInfo, coordinatedWallets);
   }
 }
 
 // ── PROCESS LOG NOTIFICATION ──────────────────────────────────
 async function processLogNotification(params) {
-  if (!isActiveHours()) return;
-
   const value = params?.result?.value;
   const subId = params?.subscription;
 
@@ -535,6 +667,13 @@ async function processLogNotification(params) {
   const trackedWallet = subIdToWallet[subId];
 
   if (!trackedWallet) return;
+
+  // Sell tracking runs 24/7 — check regardless of hour
+  const hasSellWatches = Object.keys(sellWatchlist).length > 0;
+
+  // If outside active hours AND no sell watches, nothing to do
+  if (!isActiveHours() && !hasSellWatches) return;
+
   log(`[LOG HIT] wallet ${trackedWallet.substring(0, 8)} | sig ${signature.substring(0, 12)}...`);
 
   if (pendingSigs.has(signature)) {
@@ -556,6 +695,14 @@ async function processLogNotification(params) {
     log(`[SKIP] Could not fetch tx ${signature.substring(0, 12)}`);
     return;
   }
+
+  // Sell check runs 24/7
+  if (hasSellWatches) {
+    await handlePotentialSell(trackedWallet, tx);
+  }
+
+  // Buy detection — active hours only
+  if (!isActiveHours()) return;
 
   const mint = extractMint(tx);
   if (!mint) {
@@ -661,7 +808,8 @@ const server = http.createServer((req, res) => {
     `WS: ${wsReady ? 'connected' : 'reconnecting'}\n` +
     `Subscriptions: ${subCount}/${WALLETS.length}\n` +
     `Fired alerts: ${firedAlerts.size}\n` +
-    `Active windows: ${Object.keys(activeAlerts).length}\n`
+    `Active windows: ${Object.keys(activeAlerts).length}\n` +
+    `Sell watchlist: ${Object.keys(sellWatchlist).length} token(s)\n`
   );
 });
 
@@ -672,6 +820,19 @@ server.listen(process.env.PORT || 3000, () => {
 // ── START ─────────────────────────────────────────────────────
 log(`[START] Launching WebSocket tracker | ${WALLETS.length} wallets | Active 11am-6pm ET`);
 log(`[START] WSS primary: ${WSS_PRIMARY.replace(/api_key=[^&]+/, 'api_key=***')}`);
+
+// ── OUTBOUND IP LOGGER ────────────────────────────────────────
+https.get('https://api.ipify.org?format=json', (res) => {
+  let d = '';
+  res.on('data', c => d += c);
+  res.on('end', () => {
+    try {
+      const ip = JSON.parse(d).ip;
+      log(`[IP] Outbound IP: ${ip}`);
+    } catch { log(`[IP] Could not parse outbound IP`); }
+  });
+}).on('error', (e) => log(`[IP] IP check failed: ${e.message}`));
+
 connect();
 
 // ── SELF-PING (keeps Render free tier from sleeping) ──────────
