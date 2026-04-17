@@ -464,7 +464,13 @@ async function fetchSameNameCount(mint, symbol) {
 async function getTokenAge(mint) {
   const now = Math.floor(Date.now() / 1000);
   if (skipCache[mint]) return -1;
-  if (creationCache[mint]) return now - creationCache[mint];
+  if (creationCache[mint]) {
+    // Re-validate against MAX_TOKEN_AGE every time — token may have aged out
+    // since it was first cached.
+    const age = now - creationCache[mint];
+    if (age > MAX_TOKEN_AGE) { skipCache[mint] = true; return -1; }
+    return age;
+  }
   const info = await getCachedTokenInfo(mint);
   if (!info) return null;
   const createdAt = info.creation_timestamp;
