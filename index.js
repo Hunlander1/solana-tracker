@@ -18,7 +18,7 @@ const SHYFT_API_KEY  = process.env.SHYFT_API_KEY;
 const SOL_MINT         = 'So11111111111111111111111111111111111111112';
 const WINDOW_SECS      = 180;
 const MAX_TOKEN_AGE    = 3600;
-const STRICT_AGE_CHECK = false;
+const STRICT_AGE_CHECK = true;
 
 const WSS_PRIMARY  = SHYFT_API_KEY
   ? `wss://rpc.shyft.to?api_key=${SHYFT_API_KEY}`
@@ -438,7 +438,8 @@ async function fetchSameNameCount(mint, symbol) {
       log(`[Dex] ${symbol}: ${count} other tokens in last 5h via symbol search (${pairs.length} total pairs)`);
       return count;
     }
-    log(`[Dex] Symbol search failed for ${symbol} — trying direct mint lookup...`);
+    log(`[Dex] Symbol search failed for ${symbol} — waiting 3s before mint lookup...`);
+    await new Promise(r => setTimeout(r, 3000));
   }
 
   // Path 2: direct lookup by mint address
@@ -716,6 +717,21 @@ async function processLogNotification(params) {
 
 // ── WEBSOCKET ─────────────────────────────────────────────────
 let reqIdToWallet = {};
+let lastMessageAt = Date.now();
+const WATCHDOG_MS  = 3 * 60 * 1000; // 3 minutes
+
+setInterval(() => {
+  if (!wsReady) return;
+  const silent = Date.now() - lastMessageAt;
+  if (silent > WATCHDOG_MS) {
+    log(`[WS] Watchdog: no message for ${Math.round(silent/1000)}s — force reconnecting...`);
+    wsReady = false;
+    try { ws.terminate(); } catch(e) {}
+    usingFallback = !usingFallback;
+    reconnectDelay = 5000;
+    connect();
+  }
+}, 60000);
 
 function connect(useUrl) {
   const url = useUrl ?? (usingFallback ? WSS_FALLBACK : WSS_PRIMARY);
@@ -730,6 +746,7 @@ function connect(useUrl) {
     log(`[WS] Connected — subscribing to ${WALLETS.length} wallets...`);
     wsReady = true;
     reconnectDelay = 5000;
+    lastMessageAt = Date.now();
 
     WALLETS.forEach((wallet, i) => {
       const reqId = i + 1;
@@ -756,7 +773,10 @@ function connect(useUrl) {
     }, 30000);
   });
 
+  ws.on('pong', () => { lastMessageAt = Date.now(); });
+
   ws.on('message', (data) => {
+    lastMessageAt = Date.now();
     let msg;
     try { msg = JSON.parse(data.toString()); }
     catch { return; }
