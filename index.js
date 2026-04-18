@@ -20,6 +20,14 @@ const WINDOW_SECS      = 180;
 const MAX_TOKEN_AGE    = 3600;
 const STRICT_AGE_CHECK = true;
 
+// ── SIGNAL FILTER ────────────────────────────────────────────────────────────
+// Signal fires if AT LEAST ONE condition is true:
+//   1. Same-name count >= 10
+//   2. Dev ATH >= $1,000,000
+//   3. Dev wallet is a tracked wallet
+const SAME_NAME_THRESHOLD = 10;
+const DEV_ATH_THRESHOLD   = 1_000_000;
+
 const WSS_PRIMARY  = SHYFT_API_KEY
   ? `wss://rpc.shyft.to?api_key=${SHYFT_API_KEY}`
   : 'wss://api.mainnet-beta.solana.com';
@@ -567,12 +575,39 @@ async function fetchNotableHolders(mint) {
   }
 }
 
+
+// ── SIGNAL FILTER FUNCTION ───────────────────────────────────────────────
+function shouldFireSignal(tokenMint, symbol, sameNameCount, devWallet, devAthMc) {
+  const devIsTracked   = devWallet && devWallet !== 'N/A' && devWallet !== 'unknown' && WALLET_SET.has(devWallet);
+  const devAthPasses   = devWallet && devWallet !== 'N/A' && devWallet !== 'unknown' && devAthMc !== null && devAthMc >= DEV_ATH_THRESHOLD;
+  const sameNamePasses = sameNameCount !== null && sameNameCount >= SAME_NAME_THRESHOLD;
+
+  if (sameNamePasses) {
+    log(`[FILTER] ✅ PASS — same-name count ${sameNameCount} >= ${SAME_NAME_THRESHOLD}`);
+    return true;
+  }
+  if (devAthPasses) {
+    log(`[FILTER] ✅ PASS — dev ATH $${devAthMc.toLocaleString()} >= $${DEV_ATH_THRESHOLD.toLocaleString()}`);
+    return true;
+  }
+  if (devIsTracked) {
+    log(`[FILTER] ✅ PASS — dev wallet ${devWallet.substring(0, 8)} is a tracked wallet`);
+    return true;
+  }
+
+  const snStr  = sameNameCount !== null ? sameNameCount : '?';
+  const athStr = devAthMc !== null ? `$${devAthMc.toLocaleString()}` : 'N/A';
+  const devStr = devWallet && devWallet !== 'N/A' ? devWallet.substring(0, 8) : 'unknown';
+  log(`[FILTER] ❌ SUPPRESSED #${symbol} — same-name: ${snStr}, dev ATH: ${athStr}, dev: ${devStr} (not tracked)`);
+  return false;
+}
+
 async function buildAndSendSignal(tokenMint, walletCount, elapsed, tokenInfo, coordinatedWallets) {
   try {
     const now = Math.floor(Date.now() / 1000);
     let symbol = 'UNKNOWN', mintTimeStr = 'N/A', ageStr = 'N/A';
     let liquidityStr = 'N/A', marketCapStr = 'N/A';
-    let devWallet = 'N/A', devAth = 'N/A', devAthSymbol = '';
+    let devWallet = 'N/A', devAth = 'N/A', devAthMc = null, devAthSymbol = '';
     let freshWalletsFromInfo = null;
 
     if (tokenInfo) {
@@ -602,6 +637,7 @@ async function buildAndSendSignal(tokenMint, walletCount, elapsed, tokenInfo, co
       if (athInfo?.ath_mc) {
         const athMc = parseFloat(athInfo.ath_mc);
         if (!isNaN(athMc)) {
+          devAthMc     = athMc;
           devAthSymbol = athInfo.symbol ? ` #${athInfo.symbol}` : '';
           devAth = athMc >= 1_000_000
             ? `$${(athMc / 1_000_000).toFixed(1)}M${devAthSymbol}`
@@ -619,6 +655,11 @@ async function buildAndSendSignal(tokenMint, walletCount, elapsed, tokenInfo, co
     ]);
 
     const freshWallets = freshWalletsFromInfo ?? freshWalletsFromSecurity;
+
+    // ── APPLY SIGNAL FILTER ───────────────────────────────────────────────
+    if (!shouldFireSignal(tokenMint, symbol, sameNameCount, devWallet, devAthMc)) {
+      return; // suppressed — do NOT register sell watchlist
+    }
 
     // ── REGISTER SELL WATCHLIST ─────────────────────────────────────────────
     // Only reached after buy signal is confirmed to fire.
