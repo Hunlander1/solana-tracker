@@ -429,6 +429,8 @@ async function fetchSameNameCount(mint, symbol) {
   }
 
   // Path 1: search by symbol
+  // Small pre-delay to avoid 429 rate limiting from DexScreener
+  await new Promise(r => setTimeout(r, 2500));
   if (symbol && symbol !== 'UNKNOWN') {
     log(`[Dex] Fetching same-name count by symbol for ${symbol}...`);
     const r = await dexFetch(`https://api.dexscreener.com/latest/dex/search?q=${encodeURIComponent(symbol)}`);
@@ -507,6 +509,64 @@ function sendTelegram(message) {
 }
 
 // ── SIGNAL ────────────────────────────────────────────────────
+
+// ── NOTABLE HOLDERS ───────────────────────────────────────────
+const NOTABLE_HOLDER_THRESHOLD = 50_000;
+
+async function fetchTopHolders(mint) {
+  const data = await gmgnGet('/v1/token/top_holders', {
+    chain: 'sol', address: mint, limit: '20'
+  });
+  if (!data) return [];
+  const holders = Array.isArray(data) ? data
+    : (data.holders ?? data.top_holders ?? data.data ?? []);
+  return holders;
+}
+
+async function fetchWalletValue(walletAddress) {
+  const data = await gmgnGet('/v1/wallet/info', {
+    chain: 'sol', address: walletAddress
+  });
+  if (!data) return null;
+  const val = parseFloat(
+    data.total_value ?? data.usd_value ?? data.portfolio_value ?? 0
+  );
+  return isNaN(val) ? null : val;
+}
+
+async function fetchNotableHolders(mint) {
+  try {
+    const holders = await fetchTopHolders(mint);
+    if (!holders.length) {
+      log(`[HOLDERS] No holders returned for ${mint.substring(0, 8)}`);
+      return [];
+    }
+    log(`[HOLDERS] Checking ${holders.length} top holders for ${mint.substring(0, 8)}...`);
+    const notable = [];
+    for (const holder of holders) {
+      const addr = holder.address ?? holder.wallet ?? holder.owner;
+      if (!addr) continue;
+      if (WALLET_SET.has(addr)) continue;
+      await new Promise(r => setTimeout(r, 400));
+      const value = await fetchWalletValue(addr);
+      if (value === null) continue;
+      if (value >= NOTABLE_HOLDER_THRESHOLD) {
+        const pct    = holder.percent ?? holder.percentage ?? null;
+        const pctStr = pct !== null ? ` (${parseFloat(pct).toFixed(1)}%)` : '';
+        const valStr = value >= 1_000_000
+          ? `$${(value / 1_000_000).toFixed(1)}M`
+          : `$${Math.round(value / 1000)}k`;
+        notable.push({ addr, valStr, pctStr });
+        log(`[HOLDERS] Notable: ${addr.substring(0, 8)} -- ${valStr}${pctStr}`);
+      }
+    }
+    return notable;
+  } catch(e) {
+    log(`[ERR] fetchNotableHolders: ${e.message}`);
+    return [];
+  }
+}
+
 async function buildAndSendSignal(tokenMint, walletCount, elapsed, tokenInfo, coordinatedWallets) {
   try {
     const now = Math.floor(Date.now() / 1000);
@@ -560,7 +620,7 @@ async function buildAndSendSignal(tokenMint, walletCount, elapsed, tokenInfo, co
 
     const freshWallets = freshWalletsFromInfo ?? freshWalletsFromSecurity;
 
-    // ── REGISTER SELL WATCHLIST ───────────────────────────────
+    // ── REGISTER SELL WATCHLIST ─────────────────────────────────────────────
     // Only reached after buy signal is confirmed to fire.
     if (coordinatedWallets && coordinatedWallets.size > 0) {
       sellWatchlist[tokenMint] = {
@@ -570,6 +630,16 @@ async function buildAndSendSignal(tokenMint, walletCount, elapsed, tokenInfo, co
         signalTime: Math.floor(Date.now() / 1000),
       };
       log(`[SELL] Watching ${coordinatedWallets.size} wallets for exits on #${sellWatchlist[tokenMint].symbol} (${tokenMint.substring(0, 8)})`);
+    }
+
+    // ── NOTABLE HOLDERS ─────────────────────────────────────────────────────
+    const notableHolders = await fetchNotableHolders(tokenMint);
+    let notableLine = '';
+    if (notableHolders.length > 0) {
+      const lines = notableHolders.map(h =>
+        `  • <code>${h.addr}</code> — ${h.valStr}${h.pctStr}`
+      );
+      notableLine = `\n\n💰 <b>Notable Holders (>$50k wallet)</b>\n` + lines.join('\n');
     }
 
     const signalTime = new Date().toLocaleTimeString('en-US', {
@@ -590,11 +660,12 @@ async function buildAndSendSignal(tokenMint, walletCount, elapsed, tokenInfo, co
       `Fresh Wallets: ${freshWallets !== null ? freshWallets : 'N/A'}\n` +
       `Wallets Coordinated: ${walletCount} within ${elapsed}s\n\n` +
       `Dev Wallet: ${devWalletLine}\n` +
-      `Dev ATH: ${devAth}\n\n` +
-      `Signal Time: ${signalTime}\n\n` +
+      `Dev ATH: ${devAth}` +
+      notableLine +
+      `\n\nSignal Time: ${signalTime}\n\n` +
       `<a href="https://gmgn.ai/sol/token/${tokenMint}">GMGN</a>`
     );
-    log(`[ALERT] Signal sent for #${symbol} (${tokenMint.substring(0, 8)}) | Dev ATH: ${devAth}`);
+    log(`[ALERT] Signal sent for #${symbol} (${tokenMint.substring(0, 8)}) | Dev ATH: ${devAth} | Notable: ${notableHolders.length}`);
   } catch(e) { log(`[ERR] buildAndSendSignal: ${e.message}`); }
 }
 
