@@ -438,7 +438,7 @@ async function fetchSameNameCount(mint, symbol) {
 
   // Path 1: search by symbol
   // Small pre-delay to avoid 429 rate limiting from DexScreener
-  await new Promise(r => setTimeout(r, 2500));
+  await new Promise(r => setTimeout(r, 4000));
   if (symbol && symbol !== 'UNKNOWN') {
     log(`[Dex] Fetching same-name count by symbol for ${symbol}...`);
     const r = await dexFetch(`https://api.dexscreener.com/latest/dex/search?q=${encodeURIComponent(symbol)}`);
@@ -649,12 +649,12 @@ async function buildAndSendSignal(tokenMint, walletCount, elapsed, tokenInfo, co
       if (fwStat !== undefined && fwStat !== null) freshWalletsFromInfo = fwStat;
     }
 
-    const [sameNameCount, freshWalletsFromSecurity] = await Promise.all([
-      fetchSameNameCount(tokenMint, symbol),
-      freshWalletsFromInfo === null ? fetchFreshWallets(tokenMint) : Promise.resolve(null)
-    ]);
-
-    const freshWallets = freshWalletsFromInfo ?? freshWalletsFromSecurity;
+    // Run sequentially to avoid simultaneous GMGN + DexScreener calls causing 429s
+    const freshWalletsFromSecurity = freshWalletsFromInfo === null
+      ? await fetchFreshWallets(tokenMint)
+      : null;
+    const freshWallets  = freshWalletsFromInfo ?? freshWalletsFromSecurity;
+    const sameNameCount = await fetchSameNameCount(tokenMint, symbol);
 
     // ── APPLY SIGNAL FILTER ───────────────────────────────────────────────
     if (!shouldFireSignal(tokenMint, symbol, sameNameCount, devWallet, devAthMc)) {
